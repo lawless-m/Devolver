@@ -1,69 +1,44 @@
-# Claude Code Template
+# devlog
 
-![Spellbook](spellbook.png)
+A Rust CLI tool that captures Claude Code conversations for later reference and search.
 
-A GitHub template repository containing reusable Claude Code skills and commands.
+## Overview
+
+When working with Claude Code, the development conversation is lost after context compression. This tool preserves the "how did we build this" narrative alongside your code by ingesting session JSONL files and extracting human-readable conversations.
+
+## Features
+
+- Ingests Claude Code session JSONL files
+- Filters to user prompts, assistant text responses, and tool summaries
+- Enriches with git metadata (remote, branch, commit)
+- Outputs one JSON file per session to `.devlog/`
+
+## Installation
+
+```bash
+cargo build --release
+```
 
 ## Usage
 
-### Creating a New Project
-
-1. Click **"Use this template"** on GitHub
-2. Create your new repository
-3. Your project automatically includes:
-   - Skills in `.claude/skills/`
-   - Commands in `.claude/commands/`
-
-### Available Commands
-
-| Command | Description |
-|---------|-------------|
-| `/commit` | Create a well-crafted git commit with conventional format |
-| `/publish` | Run `dotnet publish -c release` |
-| `/push` | Commit pending changes and push to remote |
-
-### Available Skills
-
-| Skill | Description |
-|-------|-------------|
-| **BrowserBridge** | Real-time browser debugging via WebSocket bridge |
-| **Creating Skills** | Guide for creating new skill documents |
-| **CSharpener** | C# static analysis for call graphs and unused code |
-| **Databases** | RDBMS patterns for DuckDB, MySQL, PostgreSQL, SQL Server |
-| **Dotnet 8 to 9** | .NET migration guide |
-| **Elasticsearch** | ES 5.2 operations - search, bulk, scroll, aliases |
-| **Email** | Email handling patterns |
-| **Image Files** | ImageMagick command-line operations |
-| **JSharpener** | JavaScript/TypeScript static analysis |
-| **Logging** | UTF-8 file logging with date-based filenames |
-| **Parquet Files** | Creating Parquet files in C# |
-| **PythonJson** | Python JSON I/O patterns |
-| **Rust** | Rust development patterns and project setup |
-| **SharePoint** | SharePoint integration |
-| **Web Frontend** | React + Tailwind + shadcn/ui artifacts |
-
-## Structure
-
-```
-your-project/
-├── .claude/
-│   ├── commands/
-│   │   ├── commit.md
-│   │   ├── publish.md
-│   │   └── push.md
-│   └── skills/
-│       ├── Databases/
-│       ├── Elasticsearch/
-│       └── ...
-├── README.md
-└── spellbook.png
+```bash
+devlog ingest <path-to-session.jsonl>
 ```
 
-## How Skills Work
+### Via Claude Code hooks
 
-Skills are markdown files that teach Claude domain-specific patterns. They're loaded automatically when relevant or can be explicitly invoked.
+Configure in `.claude/settings.json` to trigger on `PreCompact` and `SessionEnd`.
 
-## Source
+## Output
 
-This template is maintained at:
-- https://github.com/lawless-m/claude-skills
+Output files are written to `.devlog/` with the format:
+```
+YYYY-MM-DD-HHMMSS-<session_id_short>.json
+```
+
+## Documentation
+
+- [SPEC.md](SPEC.md) - Full specification
+- [SCHEMA.md](SCHEMA.md) - Output JSON schema
+- [JSONL_FORMAT.md](JSONL_FORMAT.md) - Input format details
+- [HOOKS.md](HOOKS.md) - Claude Code hooks integration
