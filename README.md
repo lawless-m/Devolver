@@ -1,5 +1,7 @@
 # devlog
 
+![devlog](devlog.png)
+
 A Rust CLI tool that captures Claude Code conversations for later reference and search.
 
 ## Overview
