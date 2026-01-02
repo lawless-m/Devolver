@@ -15,3 +15,5 @@ hostname = "0.4"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 toml = "0.8"
 serde_derive = "1.0"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }

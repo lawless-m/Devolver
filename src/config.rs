@@ -18,7 +18,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             push: Some(PushConfig {
-                endpoint: "http://localhost:8080/ingest".to_string(),
+                endpoint: "http://localhost:8090/ingest".to_string(),
                 enabled: false,
             }),
         }

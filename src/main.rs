@@ -3,6 +3,8 @@ mod git;
 mod output;
 mod config;
 mod push;
+mod server;
+mod stats;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -28,6 +30,15 @@ enum Commands {
         /// Path to the devlog JSON file to push (optional - will find most recent)
         path: Option<PathBuf>,
     },
+    /// Run the devlog receiver server
+    Serve {
+        /// Port to listen on (default: 8090)
+        #[arg(short, long, default_value = "8090")]
+        port: u16,
+        /// Directory to store received devlogs
+        #[arg(short, long, default_value = "/store/devolver")]
+        storage: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -39,6 +50,15 @@ fn main() -> Result<()> {
         }
         Commands::Push { path } => {
             push_session(path)?;
+        }
+        Commands::Serve { port, storage } => {
+            let config = server::ServerConfig {
+                storage_dir: storage,
+                port,
+            };
+            tokio::runtime::Runtime::new()
+                .context("Failed to create async runtime")?
+                .block_on(server::run_server(config))?;
         }
     }
 
