@@ -58,7 +58,7 @@ pub struct ToolUse {
 }
 
 /// Output conversation entry
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum ConversationEntry {
     #[serde(rename = "user")]

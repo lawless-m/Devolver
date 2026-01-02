@@ -1,6 +1,8 @@
 mod parser;
 mod git;
 mod output;
+mod config;
+mod push;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -21,6 +23,11 @@ enum Commands {
         /// Path to the session JSONL file (optional - will try stdin or find most recent)
         path: Option<PathBuf>,
     },
+    /// Push the most recent session to the central endpoint
+    Push {
+        /// Path to the devlog JSON file to push (optional - will find most recent)
+        path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -29,6 +36,9 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Ingest { path } => {
             ingest_session(path)?;
+        }
+        Commands::Push { path } => {
+            push_session(path)?;
         }
     }
 
@@ -68,15 +78,23 @@ fn ingest_session(path: Option<PathBuf>) -> Result<()> {
         schema_version: "1.0".to_string(),
         session_id,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        machine_id: output::get_machine_id(),
         project_dir,
         git: git_info,
         conversation,
     };
 
     // Write output
-    output::write_output(&output)?;
+    let _output_path = output::write_output(&output)?;
 
     eprintln!("Session ingested successfully");
+
+    // Auto-push if enabled
+    if let Err(e) = push::push_session(&output) {
+        eprintln!("Warning: Failed to push session: {}", e);
+        // Don't fail the whole ingest if push fails
+    }
+
     Ok(())
 }
 
@@ -161,4 +179,65 @@ fn extract_session_id(path: &PathBuf) -> String {
         .and_then(|s| s.to_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("session_{}", chrono::Utc::now().timestamp()))
+}
+
+fn push_session(path: Option<PathBuf>) -> Result<()> {
+    // Find the devlog file to push
+    let devlog_path = match path {
+        Some(p) => p,
+        None => find_most_recent_devlog()?,
+    };
+
+    eprintln!("Pushing devlog from: {}", devlog_path.display());
+
+    // Read the devlog file
+    let content = std::fs::read_to_string(&devlog_path)
+        .with_context(|| format!("Failed to read devlog file: {}", devlog_path.display()))?;
+
+    let output: output::DevlogOutput = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse devlog file: {}", devlog_path.display()))?;
+
+    // Push it
+    push::push_session(&output)?;
+
+    Ok(())
+}
+
+fn find_most_recent_devlog() -> Result<PathBuf> {
+    // Look in current directory's .devlog folder
+    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+    let devlog_dir = current_dir.join(".devlog");
+
+    if !devlog_dir.exists() {
+        anyhow::bail!("No .devlog directory found in current directory");
+    }
+
+    let mut most_recent: Option<(PathBuf, std::time::SystemTime)> = None;
+
+    for entry in std::fs::read_dir(&devlog_dir)
+        .with_context(|| format!("Failed to read directory: {}", devlog_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Ok(meta) = path.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    match most_recent {
+                        Some((_, ref time)) if modified > *time => {
+                            most_recent = Some((path, modified));
+                        }
+                        None => {
+                            most_recent = Some((path, modified));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    most_recent
+        .map(|(path, _)| path)
+        .context("No devlog JSON files found in .devlog directory")
 }
