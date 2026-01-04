@@ -45,6 +45,8 @@ pub struct ContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: Option<String>,
+    pub name: Option<String>,
+    pub input: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -133,12 +135,16 @@ pub fn filter_to_conversation(entries: Vec<RawEntry>) -> Vec<ConversationEntry> 
                     });
                 }
 
-                // Check for inline tool_use in message
+                // Check for tool_use blocks in message content
                 if let Some(MessageContent::Object(ref msg)) = entry.message {
-                    if let Some(ref tools) = msg.tool_use {
-                        for tool in tools {
-                            if let Some(action) = summarize_tool_use_from_tool(tool) {
-                                pending_tools.push(action);
+                    if let Some(ref content) = msg.content {
+                        if let ContentType::Blocks(blocks) = content {
+                            for block in blocks {
+                                if block.block_type == "tool_use" {
+                                    if let Some(action) = summarize_tool_use_from_block(block) {
+                                        pending_tools.push(action);
+                                    }
+                                }
                             }
                         }
                     }
@@ -215,6 +221,11 @@ fn summarize_tool_use(entry: &RawEntry) -> Option<String> {
 fn summarize_tool_use_from_tool(tool: &ToolUse) -> Option<String> {
     let tool_name = tool.name.as_ref().or(tool.tool_type.as_ref())?;
     Some(format_tool_action(tool_name, tool.input.as_ref()))
+}
+
+fn summarize_tool_use_from_block(block: &ContentBlock) -> Option<String> {
+    let tool_name = block.name.as_ref()?;
+    Some(format_tool_action(tool_name, block.input.as_ref()))
 }
 
 fn format_tool_action(tool_name: &str, input: Option<&serde_json::Value>) -> String {

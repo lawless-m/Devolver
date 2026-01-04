@@ -1,4 +1,5 @@
 use crate::output::DevlogOutput;
+use crate::search::{self, SearchScope};
 use crate::stats;
 use axum::{
     extract::{Query, State},
@@ -36,6 +37,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/stats", get(stats_page))
+        .route("/search", get(search_page))
         .route("/ingest", post(ingest))
         .with_state(state);
 
@@ -60,6 +62,7 @@ async fn index() -> Html<&'static str> {
 <body>
 <h1>Devlog Receiver</h1>
 <ul>
+<li><a href="search">Search</a></li>
 <li><a href="stats">Project Stats</a></li>
 <li><a href="health">Health Check</a></li>
 </ul>
@@ -69,6 +72,13 @@ async fn index() -> Html<&'static str> {
 
 #[derive(serde::Deserialize)]
 struct StatsQuery {
+    days: Option<u32>,
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    q: Option<String>,
+    scope: Option<String>,
     days: Option<u32>,
 }
 
@@ -229,6 +239,185 @@ fn format_number(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+async fn search_page(
+    State(config): State<Arc<ServerConfig>>,
+    Query(query): Query<SearchQuery>,
+) -> impl IntoResponse {
+    let scope = query
+        .scope
+        .as_deref()
+        .map(SearchScope::from_str)
+        .unwrap_or_default();
+
+    let results = query.q.as_ref().map(|q| {
+        if q.trim().is_empty() {
+            Ok(Vec::new())
+        } else {
+            search::search_devlogs(&config.storage_dir, q, scope, query.days, 50)
+        }
+    });
+
+    let html = render_search_html(
+        query.q.as_deref().unwrap_or(""),
+        query.scope.as_deref().unwrap_or("conversations"),
+        query.days,
+        results,
+    );
+
+    (StatusCode::OK, Html(html))
+}
+
+fn render_search_html(
+    query: &str,
+    scope: &str,
+    days: Option<u32>,
+    results: Option<anyhow::Result<Vec<search::SearchResult>>>,
+) -> String {
+    let mut html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<title>Search Devlogs</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }}
+h1 {{ color: #00d9ff; }}
+.search-form {{ margin-bottom: 1.5rem; }}
+.search-form input[type="text"] {{
+    width: 400px; padding: 0.5rem; font-size: 1rem;
+    background: #16213e; border: 1px solid #333; color: #eee; border-radius: 4px;
+}}
+.search-form button {{
+    padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer;
+    background: #00d9ff; color: #1a1a2e; border: none; border-radius: 4px;
+}}
+.search-form button:hover {{ background: #00b8d4; }}
+.filters {{ margin-bottom: 1rem; display: flex; gap: 1.5rem; align-items: center; }}
+.filters label {{ color: #888; cursor: pointer; }}
+.filters input[type="radio"] {{ margin-right: 0.3rem; }}
+.filters select {{
+    background: #16213e; color: #eee; border: 1px solid #333;
+    padding: 0.3rem; border-radius: 4px;
+}}
+.result {{
+    margin-bottom: 1.5rem; padding: 1rem;
+    background: #16213e; border-radius: 8px; border-left: 3px solid #00d9ff;
+}}
+.result-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 0.5rem; font-size: 0.9rem; color: #888;
+}}
+.result-header .project {{ color: #00d9ff; font-weight: bold; }}
+.result-header .type {{
+    padding: 0.15rem 0.5rem; border-radius: 3px; font-size: 0.8rem;
+}}
+.type-user {{ background: #2d5a2d; color: #8f8; }}
+.type-assistant {{ background: #5a2d5a; color: #f8f; }}
+.type-tool {{ background: #5a5a2d; color: #ff8; }}
+.snippet {{ line-height: 1.5; white-space: pre-wrap; word-break: break-word; }}
+.snippet mark {{ background: #ff0; color: #000; padding: 0 2px; }}
+a {{ color: #00d9ff; }}
+.no-results {{ color: #888; font-style: italic; }}
+.back {{ margin-bottom: 1rem; }}
+</style>
+</head>
+<body>
+<div class="back"><a href="/">← Back</a></div>
+<h1>Search Devlogs</h1>
+<form class="search-form" method="get">
+  <input type="text" name="q" placeholder="Search conversations..." value="{}" autofocus>
+  <button type="submit">Search</button>
+  <div class="filters">
+    <span>Scope:</span>
+    <label><input type="radio" name="scope" value="prompts" {}> Prompts only</label>
+    <label><input type="radio" name="scope" value="conversations" {}> Conversations</label>
+    <label><input type="radio" name="scope" value="all" {}> Everything</label>
+    <span style="margin-left: 1rem;">Days:</span>
+    <select name="days">
+      <option value="" {}>All time</option>
+      <option value="1" {}>Today</option>
+      <option value="7" {}>7 days</option>
+      <option value="30" {}>30 days</option>
+      <option value="90" {}>90 days</option>
+    </select>
+  </div>
+</form>
+"#,
+        html_escape(query),
+        if scope == "prompts" { "checked" } else { "" },
+        if scope == "conversations" { "checked" } else { "" },
+        if scope == "all" { "checked" } else { "" },
+        if days.is_none() { "selected" } else { "" },
+        if days == Some(1) { "selected" } else { "" },
+        if days == Some(7) { "selected" } else { "" },
+        if days == Some(30) { "selected" } else { "" },
+        if days == Some(90) { "selected" } else { "" },
+    );
+
+    match results {
+        None => {
+            // No search performed yet
+        }
+        Some(Ok(results)) if results.is_empty() => {
+            html.push_str("<p class=\"no-results\">No results found.</p>");
+        }
+        Some(Ok(results)) => {
+            html.push_str(&format!("<p>{} results</p>", results.len()));
+            for result in results {
+                let timestamp = chrono::DateTime::parse_from_rfc3339(&result.timestamp)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|_| result.timestamp.clone());
+
+                let type_class = match result.entry_type.as_str() {
+                    "user" => "type-user",
+                    "assistant" => "type-assistant",
+                    _ => "type-tool",
+                };
+
+                let highlighted_snippet = highlight_match(&result.snippet, &result.query);
+
+                html.push_str(&format!(
+                    r#"<div class="result">
+  <div class="result-header">
+    <span><span class="project">{}</span> · {} · {}</span>
+    <span class="type {}">{}</span>
+  </div>
+  <div class="snippet">{}</div>
+</div>
+"#,
+                    html_escape(&result.project),
+                    html_escape(&result.machine),
+                    timestamp,
+                    type_class,
+                    result.entry_type,
+                    highlighted_snippet,
+                ));
+            }
+        }
+        Some(Err(e)) => {
+            html.push_str(&format!("<p class=\"no-results\">Error: {}</p>", e));
+        }
+    }
+
+    html.push_str("</body></html>");
+    html
+}
+
+fn highlight_match(snippet: &str, query: &str) -> String {
+    let escaped = html_escape(snippet);
+    let query_lower = query.to_lowercase();
+    let escaped_lower = escaped.to_lowercase();
+
+    // Find match position in escaped string
+    if let Some(pos) = escaped_lower.find(&query_lower) {
+        let before = &escaped[..pos];
+        let matched = &escaped[pos..pos + query.len()];
+        let after = &escaped[pos + query.len()..];
+        format!("{}<mark>{}</mark>{}", before, matched, after)
+    } else {
+        escaped
     }
 }
 

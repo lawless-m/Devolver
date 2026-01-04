@@ -5,6 +5,7 @@ mod config;
 mod push;
 mod server;
 mod stats;
+mod search;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
