@@ -55,19 +55,42 @@ async fn health() -> &'static str {
     "devlog-receiver OK"
 }
 
-async fn index() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+const NAV_STYLE: &str = r#"
+.nav { display: flex; gap: 1rem; margin-bottom: 1.5rem; padding-bottom: 1rem; border-bottom: 1px solid #333; }
+.nav a { color: #888; text-decoration: none; padding: 0.3rem 0.8rem; border-radius: 4px; }
+.nav a:hover { background: #16213e; color: #00d9ff; }
+.nav a.active { background: #00d9ff; color: #1a1a2e; }
+"#;
+
+fn nav_html(active: &str) -> String {
+    format!(
+        r#"<nav class="nav">
+  <a href="search" {}>Search</a>
+  <a href="stats" {}>Stats</a>
+</nav>"#,
+        if active == "search" { "class=\"active\"" } else { "" },
+        if active == "stats" { "class=\"active\"" } else { "" },
+    )
+}
+
+async fn index() -> Html<String> {
+    Html(format!(r#"<!DOCTYPE html>
 <html>
-<head><title>Devlog Receiver</title></head>
+<head>
+<title>Devlog</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }}
+h1 {{ color: #00d9ff; }}
+a {{ color: #00d9ff; }}
+{}
+</style>
+</head>
 <body>
-<h1>Devlog Receiver</h1>
-<ul>
-<li><a href="search">Search</a></li>
-<li><a href="stats">Project Stats</a></li>
-<li><a href="health">Health Check</a></li>
-</ul>
+{}
+<h1>Devlog</h1>
+<p>Development conversation archive from Claude Code sessions.</p>
 </body>
-</html>"#)
+</html>"#, NAV_STYLE, nav_html("")))
 }
 
 #[derive(serde::Deserialize)]
@@ -79,8 +102,23 @@ struct StatsQuery {
 struct SearchQuery {
     q: Option<String>,
     scope: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
     days: Option<u32>,
 }
+
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+use serde::Deserialize;
 
 async fn stats_page(
     State(config): State<Arc<ServerConfig>>,
@@ -132,9 +170,11 @@ a {{ color: #00d9ff; }}
 .filter a {{ padding: 0.3rem 0.8rem; background: #16213e; text-decoration: none; border-radius: 4px; }}
 .filter a:hover, .filter a.active {{ background: #00d9ff; color: #1a1a2e; }}
 .total {{ margin-top: 1rem; color: #888; }}
+{}
 </style>
 </head>
 <body>
+{}
 <h1>Project Activity</h1>
 <div class="filter">
   <a href="stats?days=1" {}>Today</a>
@@ -143,6 +183,8 @@ a {{ color: #00d9ff; }}
   <a href="stats?days=90" {}>90 days</a>
 </div>
 "#,
+        NAV_STYLE,
+        nav_html("stats"),
         if days == 1 { "class=\"active\"" } else { "" },
         if days == 7 { "class=\"active\"" } else { "" },
         if days == 30 { "class=\"active\"" } else { "" },
@@ -320,12 +362,12 @@ h1 {{ color: #00d9ff; }}
 .snippet mark {{ background: #ff0; color: #000; padding: 0 2px; }}
 a {{ color: #00d9ff; }}
 .no-results {{ color: #888; font-style: italic; }}
-.back {{ margin-bottom: 1rem; }}
+{}
 </style>
 </head>
 <body>
-<div class="back"><a href="/">← Back</a></div>
-<h1>Search Devlogs</h1>
+{}
+<h1>Search</h1>
 <form class="search-form" method="get">
   <input type="text" name="q" placeholder="Search conversations..." value="{}" autofocus>
   <button type="submit">Search</button>
@@ -345,6 +387,8 @@ a {{ color: #00d9ff; }}
   </div>
 </form>
 "#,
+        NAV_STYLE,
+        nav_html("search"),
         html_escape(query),
         if scope == "prompts" { "checked" } else { "" },
         if scope == "conversations" { "checked" } else { "" },
@@ -410,11 +454,15 @@ fn highlight_match(snippet: &str, query: &str) -> String {
     let query_lower = query.to_lowercase();
     let escaped_lower = escaped.to_lowercase();
 
-    // Find match position in escaped string
-    if let Some(pos) = escaped_lower.find(&query_lower) {
-        let before = &escaped[..pos];
-        let matched = &escaped[pos..pos + query.len()];
-        let after = &escaped[pos + query.len()..];
+    // Find match position in escaped string (char-safe)
+    if let Some(byte_pos) = escaped_lower.find(&query_lower) {
+        // Convert byte position to char position
+        let char_pos = escaped_lower[..byte_pos].chars().count();
+        let query_char_len = query_lower.chars().count();
+
+        let before: String = escaped.chars().take(char_pos).collect();
+        let matched: String = escaped.chars().skip(char_pos).take(query_char_len).collect();
+        let after: String = escaped.chars().skip(char_pos + query_char_len).collect();
         format!("{}<mark>{}</mark>{}", before, matched, after)
     } else {
         escaped

@@ -182,45 +182,40 @@ fn search_entry(
     }
 }
 
-/// Create a snippet with context around the match
+/// Create a snippet with context around the match (char-safe)
 fn create_snippet(content: &str, query_lower: &str) -> String {
     let content_lower = content.to_lowercase();
-    let match_pos = match content_lower.find(query_lower) {
+
+    // Find match position in chars (not bytes)
+    let match_byte_pos = match content_lower.find(query_lower) {
         Some(pos) => pos,
         None => return content.chars().take(200).collect(),
     };
 
+    // Convert byte position to char position
+    let match_char_pos = content_lower[..match_byte_pos].chars().count();
+    let query_char_len = query_lower.chars().count();
+    let total_chars = content.chars().count();
+
     let context_chars = 80;
 
-    // Find start position (try to start at word boundary)
-    let start = if match_pos > context_chars {
-        let candidate = match_pos - context_chars;
-        // Find next space after candidate
-        content[candidate..]
-            .find(' ')
-            .map(|i| candidate + i + 1)
-            .unwrap_or(candidate)
-    } else {
-        0
-    };
+    // Calculate start/end in char positions
+    let start_char = match_char_pos.saturating_sub(context_chars);
+    let end_char = (match_char_pos + query_char_len + context_chars).min(total_chars);
 
-    // Find end position
-    let end_candidate = match_pos + query_lower.len() + context_chars;
-    let end = if end_candidate < content.len() {
-        // Find previous space before end
-        content[..end_candidate]
-            .rfind(' ')
-            .unwrap_or(end_candidate)
-    } else {
-        content.len()
-    };
+    // Extract snippet using chars
+    let snippet_chars: String = content
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
 
     let mut snippet = String::new();
-    if start > 0 {
+    if start_char > 0 {
         snippet.push_str("...");
     }
-    snippet.push_str(content[start..end].trim());
-    if end < content.len() {
+    snippet.push_str(snippet_chars.trim());
+    if end_char < total_chars {
         snippet.push_str("...");
     }
 
