@@ -13,6 +13,10 @@ pub struct ProjectStats {
     pub files_touched: usize,
     pub prompt_words: usize,
     pub response_words: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub last_activity: String,
 }
 
@@ -64,6 +68,10 @@ pub fn get_project_stats(storage_dir: &Path, days: u32) -> Result<Vec<ProjectSta
                             files_touched: 0,
                             prompt_words: 0,
                             response_words: 0,
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
                             last_activity: String::new(),
                         });
 
@@ -74,6 +82,10 @@ pub fn get_project_stats(storage_dir: &Path, days: u32) -> Result<Vec<ProjectSta
                         entry.files_touched += session_stats.files_touched;
                         entry.prompt_words += session_stats.prompt_words;
                         entry.response_words += session_stats.response_words;
+                        entry.input_tokens += session_stats.input_tokens;
+                        entry.output_tokens += session_stats.output_tokens;
+                        entry.cache_read_tokens += session_stats.cache_read_tokens;
+                        entry.cache_write_tokens += session_stats.cache_write_tokens;
 
                         if devlog.timestamp > entry.last_activity {
                             entry.last_activity = devlog.timestamp.clone();
@@ -108,6 +120,10 @@ pub fn get_project_stats_grouped(storage_dir: &Path, days: u32) -> Result<Vec<Pr
             files_touched: 0,
             prompt_words: 0,
             response_words: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             last_activity: String::new(),
         });
 
@@ -117,6 +133,10 @@ pub fn get_project_stats_grouped(storage_dir: &Path, days: u32) -> Result<Vec<Pr
         entry.files_touched += stat.files_touched;
         entry.prompt_words += stat.prompt_words;
         entry.response_words += stat.response_words;
+        entry.input_tokens += stat.input_tokens;
+        entry.output_tokens += stat.output_tokens;
+        entry.cache_read_tokens += stat.cache_read_tokens;
+        entry.cache_write_tokens += stat.cache_write_tokens;
 
         if stat.last_activity > entry.last_activity {
             entry.last_activity = stat.last_activity;
@@ -147,6 +167,10 @@ struct SessionStats {
     files_touched: usize,
     prompt_words: usize,
     response_words: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
 }
 
 fn analyze_session(devlog: &DevlogOutput) -> SessionStats {
@@ -159,6 +183,10 @@ fn analyze_session(devlog: &DevlogOutput) -> SessionStats {
         files_touched: 0,
         prompt_words: 0,
         response_words: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
     };
 
     let mut files: HashSet<String> = HashSet::new();
@@ -169,8 +197,14 @@ fn analyze_session(devlog: &DevlogOutput) -> SessionStats {
                 stats.prompts += 1;
                 stats.prompt_words += count_words(content);
             }
-            ConversationEntry::Assistant { content, .. } => {
+            ConversationEntry::Assistant { content, usage, .. } => {
                 stats.response_words += count_words(content);
+                if let Some(ref usage) = usage {
+                    stats.input_tokens += usage.input_tokens.unwrap_or(0);
+                    stats.output_tokens += usage.output_tokens.unwrap_or(0);
+                    stats.cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
+                    stats.cache_write_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
+                }
             }
             ConversationEntry::ToolSummary { actions } => {
                 stats.tool_calls += actions.len();
@@ -211,10 +245,10 @@ pub fn print_stats(stats: &[ProjectStats], days: u32) {
 
     println!("Project activity (last {} days):\n", days);
     println!(
-        "{:<15} {:<25} {:>8} {:>8}  {}",
-        "Machine", "Project", "Sessions", "Prompts", "Last Activity"
+        "{:<15} {:<25} {:>8} {:>8} {:>10} {:>10}  {}",
+        "Machine", "Project", "Sessions", "Prompts", "In Tokens", "Out Tokens", "Last Activity"
     );
-    println!("{}", "-".repeat(78));
+    println!("{}", "-".repeat(110));
 
     for stat in stats {
         let last = if stat.last_activity.is_empty() {
@@ -226,24 +260,48 @@ pub fn print_stats(stats: &[ProjectStats], days: u32) {
         };
 
         println!(
-            "{:<15} {:<25} {:>8} {:>8}  {}",
+            "{:<15} {:<25} {:>8} {:>8} {:>10} {:>10}  {}",
             truncate(&stat.machine, 15),
             truncate(&stat.project, 25),
             stat.session_count,
             stat.prompt_count,
+            format_tokens(stat.input_tokens + stat.cache_read_tokens),
+            format_tokens(stat.output_tokens),
             last
         );
     }
 
     let total_sessions: usize = stats.iter().map(|s| s.session_count).sum();
     let total_prompts: usize = stats.iter().map(|s| s.prompt_count).sum();
-    println!("{}", "-".repeat(78));
+    let total_in_tokens: u64 = stats.iter().map(|s| s.input_tokens + s.cache_read_tokens).sum();
+    let total_out_tokens: u64 = stats.iter().map(|s| s.output_tokens).sum();
+    let total_cache_read: u64 = stats.iter().map(|s| s.cache_read_tokens).sum();
+    let total_cache_write: u64 = stats.iter().map(|s| s.cache_write_tokens).sum();
+
+    println!("{}", "-".repeat(110));
     println!(
-        "Total: {} sessions, {} prompts across {} projects",
+        "Total: {} sessions, {} prompts, {} in, {} out across {} projects",
         total_sessions,
         total_prompts,
+        format_tokens(total_in_tokens),
+        format_tokens(total_out_tokens),
         stats.len()
     );
+    println!(
+        "Cache: {} read, {} written",
+        format_tokens(total_cache_read),
+        format_tokens(total_cache_write)
+    );
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

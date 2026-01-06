@@ -59,6 +59,15 @@ pub struct ToolUse {
     pub input: Option<serde_json::Value>,
 }
 
+/// Token usage information from Claude API
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
 /// Output conversation entry
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
@@ -72,6 +81,8 @@ pub enum ConversationEntry {
     Assistant {
         timestamp: Option<String>,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<TokenUsage>,
     },
     #[serde(rename = "tool_summary")]
     ToolSummary { actions: Vec<String> },
@@ -129,9 +140,11 @@ pub fn filter_to_conversation(entries: Vec<RawEntry>) -> Vec<ConversationEntry> 
 
                 let content = extract_content(&entry);
                 if !content.is_empty() {
+                    let usage = extract_usage(&entry);
                     conversation.push(ConversationEntry::Assistant {
                         timestamp: entry.timestamp,
                         content,
+                        usage,
                     });
                 }
 
@@ -209,6 +222,20 @@ fn extract_content(entry: &RawEntry) -> String {
     }
 
     String::new()
+}
+
+fn extract_usage(entry: &RawEntry) -> Option<TokenUsage> {
+    // Look for usage in message.usage or extra.message.usage
+    if let Some(MessageContent::Object(ref msg)) = entry.message {
+        if let Some(usage_val) = msg.extra.get("usage") {
+            // Try to deserialize the usage object
+            if let Ok(usage) = serde_json::from_value::<TokenUsage>(usage_val.clone()) {
+                return Some(usage);
+            }
+        }
+    }
+
+    None
 }
 
 fn summarize_tool_use(entry: &RawEntry) -> Option<String> {
