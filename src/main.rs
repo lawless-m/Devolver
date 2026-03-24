@@ -40,6 +40,15 @@ enum Commands {
         #[arg(short, long, default_value = "/store/devolver")]
         storage: PathBuf,
     },
+    /// Show token usage and tool call stats across projects
+    Stats {
+        /// Directory where devlogs are stored
+        #[arg(short, long, default_value = "/store/devolver")]
+        storage: PathBuf,
+        /// Number of days to look back
+        #[arg(short, long, default_value = "30")]
+        days: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -60,6 +69,10 @@ fn main() -> Result<()> {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime")?
                 .block_on(server::run_server(config))?;
+        }
+        Commands::Stats { storage, days } => {
+            let project_stats = stats::get_project_stats_grouped(&storage, days)?;
+            stats::print_stats(&project_stats, days);
         }
     }
 
@@ -121,19 +134,22 @@ fn ingest_session(path: Option<PathBuf>) -> Result<()> {
 
 fn find_session_from_stdin_or_recent() -> Result<PathBuf> {
     // First, try to read from stdin (hook input)
-    use std::io::{self, BufRead};
+    use std::io::{self, Read};
 
-    let stdin = io::stdin();
     let mut stdin_content = String::new();
 
     // Try non-blocking read from stdin
-    if atty::is(atty::Stream::Stdin) {
-        // No stdin piped, look for recent session
-    } else {
-        for line in stdin.lock().lines() {
-            if let Ok(line) = line {
-                stdin_content.push_str(&line);
-            }
+    if !atty::is(atty::Stream::Stdin) {
+        // Stdin is a pipe - read with a short timeout to avoid hanging
+        // when the pipe doesn't close promptly (e.g. Claude Code hooks)
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = io::stdin().lock().read_to_string(&mut buf);
+            let _ = tx.send(buf);
+        });
+        if let Ok(buf) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            stdin_content = buf;
         }
     }
 
