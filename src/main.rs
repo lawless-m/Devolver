@@ -86,6 +86,18 @@ fn ingest_session(path: Option<PathBuf>) -> Result<()> {
         None => find_session_from_stdin_or_recent()?,
     };
 
+    // At SessionStart:startup the hook fires before Claude Code has written the
+    // transcript file, so it may not exist yet. There is nothing to ingest in that
+    // case — succeed quietly rather than erroring. (On resume/clear/compact the file
+    // already exists and is ingested normally.)
+    if !session_path.exists() {
+        eprintln!(
+            "No session file yet, nothing to ingest: {}",
+            session_path.display()
+        );
+        return Ok(());
+    }
+
     eprintln!("Ingesting session from: {}", session_path.display());
 
     // Parse the JSONL file
