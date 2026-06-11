@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::thread::sleep;
+use std::time::Duration;
 
 /// Raw entry from Claude Code JSONL file
 #[derive(Debug, Deserialize)]
@@ -88,9 +90,34 @@ pub enum ConversationEntry {
     ToolSummary { actions: Vec<String> },
 }
 
+/// Open a file, retrying briefly on Windows sharing/lock violations.
+///
+/// Claude Code keeps the session JSONL open while writing it, which can yield
+/// ERROR_SHARING_VIOLATION (os error 32) / ERROR_LOCK_VIOLATION (os error 33)
+/// for a brief window when a hook (resume/compact/Stop) reads it mid-write.
+/// Retry a few times so the transient lock clears instead of failing the ingest.
+fn open_with_retry(path: &Path) -> std::io::Result<File> {
+    const MAX_ATTEMPTS: u32 = 10;
+    let mut attempt = 0;
+    loop {
+        match File::open(path) {
+            Ok(file) => return Ok(file),
+            Err(e) => {
+                attempt += 1;
+                let transient = matches!(e.raw_os_error(), Some(32) | Some(33));
+                if transient && attempt < MAX_ATTEMPTS {
+                    sleep(Duration::from_millis(50));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Parse a JSONL session file into raw entries
 pub fn parse_session_file(path: &Path) -> Result<Vec<RawEntry>> {
-    let file = File::open(path).context("Failed to open session file")?;
+    let file = open_with_retry(path).context("Failed to open session file")?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
 
