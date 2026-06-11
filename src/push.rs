@@ -20,6 +20,8 @@ pub fn push_session(output: &DevlogOutput) -> Result<()> {
         }
     };
 
+    crate::version::warn_if_outdated();
+
     eprintln!("Pushing session to: {}", push_config.endpoint);
 
     let client = Client::builder()

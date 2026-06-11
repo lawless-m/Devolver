@@ -6,6 +6,7 @@ mod push;
 mod server;
 mod stats;
 mod search;
+mod version;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "devlog")]
+#[command(version)]
 #[command(about = "Claude Code session ingester - captures conversations for later reference")]
 struct Cli {
     #[command(subcommand)]
@@ -53,6 +55,7 @@ fn main() -> Result<()> {
             push_session(path)?;
         }
         Commands::Serve { port, storage } => {
+            version::warn_if_outdated();
             let config = server::ServerConfig {
                 storage_dir: storage,
                 port,
