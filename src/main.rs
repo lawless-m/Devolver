@@ -40,15 +40,6 @@ enum Commands {
         #[arg(short, long, default_value = "/store/devolver")]
         storage: PathBuf,
     },
-    /// Show token usage and tool call stats across projects
-    Stats {
-        /// Directory where devlogs are stored
-        #[arg(short, long, default_value = "/store/devolver")]
-        storage: PathBuf,
-        /// Number of days to look back
-        #[arg(short, long, default_value = "30")]
-        days: u32,
-    },
 }
 
 fn main() -> Result<()> {
@@ -69,10 +60,6 @@ fn main() -> Result<()> {
             tokio::runtime::Runtime::new()
                 .context("Failed to create async runtime")?
                 .block_on(server::run_server(config))?;
-        }
-        Commands::Stats { storage, days } => {
-            let project_stats = stats::get_project_stats_grouped(&storage, days)?;
-            stats::print_stats(&project_stats, days);
         }
     }
 

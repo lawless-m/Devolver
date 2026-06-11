@@ -8,8 +8,6 @@ use std::path::Path;
 pub struct SearchResult {
     pub machine: String,
     pub project: String,
-    pub session_id: String,
-    pub session_file: String,
     pub timestamp: String,
     pub entry_type: String,
     pub snippet: String,
@@ -84,9 +82,6 @@ pub fn search_devlogs(
                             }
                         }
 
-                        let session_file =
-                            file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-
                         // Search conversation entries
                         for entry in &devlog.conversation {
                             if let Some(result) = search_entry(
@@ -96,8 +91,6 @@ pub fn search_devlogs(
                                 scope,
                                 &machine,
                                 &project,
-                                &devlog.session_id,
-                                &session_file,
                                 &devlog.timestamp,
                             ) {
                                 results.push(result);
@@ -131,8 +124,6 @@ fn search_entry(
     scope: SearchScope,
     machine: &str,
     project: &str,
-    session_id: &str,
-    session_file: &str,
     timestamp: &str,
 ) -> Option<SearchResult> {
     let (entry_type, content) = match entry {
@@ -153,8 +144,6 @@ fn search_entry(
                 return Some(SearchResult {
                     machine: machine.to_string(),
                     project: project.to_string(),
-                    session_id: session_id.to_string(),
-                    session_file: session_file.to_string(),
                     timestamp: timestamp.to_string(),
                     entry_type: "tool".to_string(),
                     snippet: create_snippet(&joined, query_lower),
@@ -170,8 +159,6 @@ fn search_entry(
         Some(SearchResult {
             machine: machine.to_string(),
             project: project.to_string(),
-            session_id: session_id.to_string(),
-            session_file: session_file.to_string(),
             timestamp: timestamp.to_string(),
             entry_type: entry_type.to_string(),
             snippet: create_snippet(content, query_lower),

@@ -30,7 +30,6 @@ pub enum MessageContent {
 #[derive(Debug, Deserialize)]
 pub struct MessageObject {
     pub content: Option<ContentType>,
-    pub tool_use: Option<Vec<ToolUse>>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -48,16 +47,6 @@ pub struct ContentBlock {
     pub block_type: String,
     pub text: Option<String>,
     pub name: Option<String>,
-    pub input: Option<serde_json::Value>,
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ToolUse {
-    pub name: Option<String>,
-    #[serde(rename = "type")]
-    pub tool_type: Option<String>,
     pub input: Option<serde_json::Value>,
 }
 
@@ -270,11 +259,6 @@ fn summarize_tool_use(entry: &RawEntry) -> Option<String> {
     let input = entry.input.as_ref();
 
     Some(format_tool_action(tool_name, input))
-}
-
-fn summarize_tool_use_from_tool(tool: &ToolUse) -> Option<String> {
-    let tool_name = tool.name.as_ref().or(tool.tool_type.as_ref())?;
-    Some(format_tool_action(tool_name, tool.input.as_ref()))
 }
 
 fn summarize_tool_use_from_block(block: &ContentBlock) -> Option<String> {

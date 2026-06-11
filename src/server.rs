@@ -154,8 +154,8 @@ fn render_stats_html(
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }}
 h1 {{ color: #00d9ff; }}
-table {{ border-collapse: collapse; width: 100%; max-width: 1000px; }}
-th, td {{ padding: 0.5rem 1rem; text-align: left; border-bottom: 1px solid #333; }}
+table {{ border-collapse: collapse; width: 100%; max-width: 1400px; }}
+th, td {{ padding: 0.5rem 1rem; text-align: left; border-bottom: 1px solid #333; white-space: nowrap; }}
 th {{ background: #16213e; color: #00d9ff; }}
 tr:hover {{ background: #16213e; }}
 tr.parent {{ cursor: pointer; }}
@@ -196,7 +196,7 @@ a {{ color: #00d9ff; }}
     } else {
         html.push_str(
             r#"<table>
-<tr><th>Project</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Files</th><th class="number">Words In</th><th class="number">Words Out</th><th>Last Activity</th></tr>
+<tr><th>Project</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Files</th><th class="number">Words In</th><th class="number">Words Out</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th>Last Activity</th></tr>
 "#,
         );
 
@@ -207,7 +207,7 @@ a {{ color: #00d9ff; }}
 
             // Parent row (grouped)
             html.push_str(&format!(
-                "<tr class=\"parent\" data-idx=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"parent\" data-idx=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                 idx,
                 html_escape(&stat.project),
                 stat.prompt_count,
@@ -215,6 +215,9 @@ a {{ color: #00d9ff; }}
                 stat.files_touched,
                 format_number(stat.prompt_words),
                 format_number(stat.response_words),
+                format_tokens(stat.input_tokens),
+                format_tokens(stat.output_tokens),
+                format_cache_tokens(stat.cache_read_tokens, stat.cache_write_tokens),
                 last
             ));
 
@@ -225,7 +228,7 @@ a {{ color: #00d9ff; }}
                     .unwrap_or_else(|_| machine_stat.last_activity.clone());
 
                 html.push_str(&format!(
-                    "<tr class=\"child\" data-parent=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                    "<tr class=\"child\" data-parent=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                     idx,
                     html_escape(&machine_stat.machine),
                     machine_stat.prompt_count,
@@ -233,6 +236,9 @@ a {{ color: #00d9ff; }}
                     machine_stat.files_touched,
                     format_number(machine_stat.prompt_words),
                     format_number(machine_stat.response_words),
+                    format_tokens(machine_stat.input_tokens),
+                    format_tokens(machine_stat.output_tokens),
+                    format_cache_tokens(machine_stat.cache_read_tokens, machine_stat.cache_write_tokens),
                     m_last
                 ));
             }
@@ -244,12 +250,20 @@ a {{ color: #00d9ff; }}
         let total_tools: usize = grouped.iter().map(|s| s.tool_calls).sum();
         let total_words_in: usize = grouped.iter().map(|s| s.prompt_words).sum();
         let total_words_out: usize = grouped.iter().map(|s| s.response_words).sum();
+        let total_input_tokens: u64 = grouped.iter().map(|s| s.input_tokens).sum();
+        let total_output_tokens: u64 = grouped.iter().map(|s| s.output_tokens).sum();
+        let total_cache_read: u64 = grouped.iter().map(|s| s.cache_read_tokens).sum();
+        let total_cache_write: u64 = grouped.iter().map(|s| s.cache_write_tokens).sum();
         html.push_str(&format!(
-            "<p class=\"total\">{} prompts, {} tool calls, {}k words in, {}k words out</p>",
+            "<p class=\"total\">{} prompts, {} tool calls, {}k words in, {}k words out | {} tokens in, {} tokens out, {} cache read, {} cache write</p>",
             total_prompts,
             total_tools,
             total_words_in / 1000,
             total_words_out / 1000,
+            format_tokens(total_input_tokens),
+            format_tokens(total_output_tokens),
+            format_tokens(total_cache_read),
+            format_tokens(total_cache_write),
         ));
     }
 
@@ -281,6 +295,26 @@ fn format_number(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n == 0 {
+        "-".to_string()
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_cache_tokens(read: u64, write: u64) -> String {
+    if read == 0 && write == 0 {
+        "-".to_string()
+    } else {
+        format!("{}/{}", format_tokens(read), format_tokens(write))
     }
 }
 
