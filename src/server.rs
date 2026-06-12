@@ -164,6 +164,7 @@ tr.parent.expanded td:first-child::before {{ content: "▼ "; }}
 tr.child {{ display: none; background: #0d1117; }}
 tr.child.visible {{ display: table-row; }}
 tr.child td:first-child {{ padding-left: 2rem; color: #888; }}
+tr.totals td {{ font-weight: bold; background: #16213e; border-top: 2px solid #00d9ff; }}
 .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
 a {{ color: #00d9ff; }}
 .filter {{ margin-bottom: 1rem; display: flex; gap: 0.5rem; }}
@@ -246,10 +247,9 @@ a {{ color: #00d9ff; }}
             }
         }
 
-        html.push_str("</table>");
-
         let total_prompts: usize = grouped.iter().map(|s| s.prompt_count).sum();
         let total_tools: usize = grouped.iter().map(|s| s.tool_calls).sum();
+        let total_files: usize = grouped.iter().map(|s| s.files_touched).sum();
         let total_words_in: usize = grouped.iter().map(|s| s.prompt_words).sum();
         let total_words_out: usize = grouped.iter().map(|s| s.response_words).sum();
         let total_input_tokens: u64 = grouped.iter().map(|s| s.input_tokens).sum();
@@ -257,6 +257,21 @@ a {{ color: #00d9ff; }}
         let total_cache_read: u64 = grouped.iter().map(|s| s.cache_read_tokens).sum();
         let total_cache_write: u64 = grouped.iter().map(|s| s.cache_write_tokens).sum();
         let total_cost: f64 = grouped.iter().map(|s| s.cost_usd()).sum();
+
+        html.push_str(&format!(
+            "<tr class=\"totals\"><td>Total</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td></td></tr>\n",
+            total_prompts,
+            total_tools,
+            total_files,
+            format_number(total_words_in),
+            format_number(total_words_out),
+            format_tokens(total_input_tokens),
+            format_tokens(total_output_tokens),
+            format_cache_tokens(total_cache_read, total_cache_write),
+            format_cost(total_cost),
+        ));
+        html.push_str("</table>");
+
         html.push_str(&format!(
             "<p class=\"total\">{} prompts, {} tool calls, {}k words in, {}k words out | {} tokens in, {} tokens out, {} cache read, {} cache write | est. API cost {}</p>",
             total_prompts,
