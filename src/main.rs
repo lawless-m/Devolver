@@ -49,7 +49,13 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Ingest { path } => {
-            version::warn_if_outdated();
+            // Ingest runs as a Claude Code hook: stderr from a successful hook
+            // is discarded, so emit the hook-protocol systemMessage JSON on
+            // stdout to surface the warning in the session UI.
+            if let Some(warning) = version::outdated_warning() {
+                eprintln!("{}", warning);
+                println!("{}", serde_json::json!({ "systemMessage": warning }));
+            }
             ingest_session(path)?;
         }
         Commands::Push { path } => {
