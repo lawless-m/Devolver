@@ -166,6 +166,7 @@ tr.parent.expanded td:first-child::before {{ content: "▼ "; }}
 tr.child {{ display: none; background: #0d1117; }}
 tr.child.visible {{ display: table-row; }}
 tr.child td:first-child {{ padding-left: 2rem; color: #888; }}
+tr.totals td {{ font-weight: bold; background: #16213e; border-top: 2px solid #00d9ff; }}
 .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
 a {{ color: #00d9ff; }}
 .filter {{ margin-bottom: 1rem; display: flex; gap: 0.5rem; }}
@@ -198,7 +199,7 @@ a {{ color: #00d9ff; }}
     } else {
         html.push_str(
             r#"<table>
-<tr><th>Project</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Files</th><th class="number">Words In</th><th class="number">Words Out</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th>Last Activity</th></tr>
+<tr><th>Project</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Files</th><th class="number">Words In</th><th class="number">Words Out</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th class="number">Est. Cost</th><th>Last Activity</th></tr>
 "#,
         );
 
@@ -209,7 +210,7 @@ a {{ color: #00d9ff; }}
 
             // Parent row (grouped)
             html.push_str(&format!(
-                "<tr class=\"parent\" data-idx=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"parent\" data-idx=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                 idx,
                 html_escape(&stat.project),
                 stat.prompt_count,
@@ -220,6 +221,7 @@ a {{ color: #00d9ff; }}
                 format_tokens(stat.input_tokens),
                 format_tokens(stat.output_tokens),
                 format_cache_tokens(stat.cache_read_tokens, stat.cache_write_tokens),
+                format_cost(stat.cost_usd()),
                 last
             ));
 
@@ -230,7 +232,7 @@ a {{ color: #00d9ff; }}
                     .unwrap_or_else(|_| machine_stat.last_activity.clone());
 
                 html.push_str(&format!(
-                    "<tr class=\"child\" data-parent=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                    "<tr class=\"child\" data-parent=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                     idx,
                     html_escape(&machine_stat.machine),
                     machine_stat.prompt_count,
@@ -241,23 +243,39 @@ a {{ color: #00d9ff; }}
                     format_tokens(machine_stat.input_tokens),
                     format_tokens(machine_stat.output_tokens),
                     format_cache_tokens(machine_stat.cache_read_tokens, machine_stat.cache_write_tokens),
+                    format_cost(machine_stat.cost_usd()),
                     m_last
                 ));
             }
         }
 
-        html.push_str("</table>");
-
         let total_prompts: usize = grouped.iter().map(|s| s.prompt_count).sum();
         let total_tools: usize = grouped.iter().map(|s| s.tool_calls).sum();
+        let total_files: usize = grouped.iter().map(|s| s.files_touched).sum();
         let total_words_in: usize = grouped.iter().map(|s| s.prompt_words).sum();
         let total_words_out: usize = grouped.iter().map(|s| s.response_words).sum();
         let total_input_tokens: u64 = grouped.iter().map(|s| s.input_tokens).sum();
         let total_output_tokens: u64 = grouped.iter().map(|s| s.output_tokens).sum();
         let total_cache_read: u64 = grouped.iter().map(|s| s.cache_read_tokens).sum();
         let total_cache_write: u64 = grouped.iter().map(|s| s.cache_write_tokens).sum();
+        let total_cost: f64 = grouped.iter().map(|s| s.cost_usd()).sum();
+
         html.push_str(&format!(
-            "<p class=\"total\">{} prompts, {} tool calls, {}k words in, {}k words out | {} tokens in, {} tokens out, {} cache read, {} cache write</p>",
+            "<tr class=\"totals\"><td>Total</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td></td></tr>\n",
+            total_prompts,
+            total_tools,
+            total_files,
+            format_number(total_words_in),
+            format_number(total_words_out),
+            format_tokens(total_input_tokens),
+            format_tokens(total_output_tokens),
+            format_cache_tokens(total_cache_read, total_cache_write),
+            format_cost(total_cost),
+        ));
+        html.push_str("</table>");
+
+        html.push_str(&format!(
+            "<p class=\"total\">{} prompts, {} tool calls, {}k words in, {}k words out | {} tokens in, {} tokens out, {} cache read, {} cache write | est. API cost {}</p>",
             total_prompts,
             total_tools,
             total_words_in / 1000,
@@ -266,7 +284,10 @@ a {{ color: #00d9ff; }}
             format_tokens(total_output_tokens),
             format_tokens(total_cache_read),
             format_tokens(total_cache_write),
+            format_cost(total_cost),
         ));
+
+        html.push_str(&render_model_breakdown(grouped));
     }
 
     html.push_str(r#"
@@ -309,6 +330,63 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn render_model_breakdown(grouped: &[stats::ProjectStats]) -> String {
+    use std::collections::HashMap;
+
+    let mut by_model: HashMap<String, stats::ModelTokens> = HashMap::new();
+    for stat in grouped {
+        for (model, tokens) in &stat.model_tokens {
+            let entry = by_model.entry(model.clone()).or_default();
+            entry.input_tokens += tokens.input_tokens;
+            entry.output_tokens += tokens.output_tokens;
+            entry.cache_read_tokens += tokens.cache_read_tokens;
+            entry.cache_write_tokens += tokens.cache_write_tokens;
+        }
+    }
+
+    if by_model.is_empty() {
+        return String::new();
+    }
+
+    let mut rows: Vec<(String, stats::ModelTokens, f64)> = by_model
+        .into_iter()
+        .map(|(model, tokens)| {
+            let cost = stats::estimate_cost(&model, &tokens);
+            (model, tokens, cost)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut html = String::from(
+        r#"<h2>By Model</h2>
+<table>
+<tr><th>Model</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th class="number">Est. Cost</th></tr>
+"#,
+    );
+    for (model, tokens, cost) in rows {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td></tr>\n",
+            html_escape(&model),
+            format_tokens(tokens.input_tokens),
+            format_tokens(tokens.output_tokens),
+            format_cache_tokens(tokens.cache_read_tokens, tokens.cache_write_tokens),
+            format_cost(cost),
+        ));
+    }
+    html.push_str("</table>");
+    html
+}
+
+fn format_cost(cost: f64) -> String {
+    if cost == 0.0 {
+        "-".to_string()
+    } else if cost < 0.01 {
+        "<$0.01".to_string()
+    } else {
+        format!("${:.2}", cost)
     }
 }
 
