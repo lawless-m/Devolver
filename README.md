@@ -44,3 +44,4 @@ YYYY-MM-DD-HHMMSS-<session_id_short>.json
 - [SCHEMA.md](SCHEMA.md) - Output JSON schema
 - [JSONL_FORMAT.md](JSONL_FORMAT.md) - Input format details
 - [HOOKS.md](HOOKS.md) - Claude Code hooks integration
+
