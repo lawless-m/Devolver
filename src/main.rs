@@ -49,9 +49,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Ingest { path } => {
+            version::warn_if_outdated();
             ingest_session(path)?;
         }
         Commands::Push { path } => {
+            version::warn_if_outdated();
             push_session(path)?;
         }
         Commands::Serve { port, storage } => {

@@ -1,37 +1,40 @@
 use std::time::Duration;
 
-const GITHUB_CARGO_TOML: &str =
-    "https://raw.githubusercontent.com/lawless-m/Devolver/master/Cargo.toml";
+const GITHUB_COMMITS_API: &str =
+    "https://api.github.com/repos/lawless-m/Devolver/commits/master";
 
-/// Compare this binary's version against Cargo.toml on GitHub master and warn
-/// on stderr if they differ. Network or parse failures are silently ignored —
-/// the check must never break ingest/push/serve.
+/// Compare the commit this binary was built from against GitHub master HEAD
+/// and warn on stderr if they differ. Network or parse failures are silently
+/// ignored — the check must never break ingest/push/serve.
 pub fn warn_if_outdated() {
-    let local = env!("CARGO_PKG_VERSION");
-    if let Some(remote) = fetch_github_version() {
+    let local = env!("GIT_COMMIT");
+    if local.is_empty() {
+        return; // built outside a git checkout
+    }
+    if let Some(remote) = fetch_github_master_sha() {
         if remote != local {
             eprintln!(
-                "WARNING: devlog version mismatch: this binary is {} but GitHub master has {}. \
-                 Run 'git pull && make install' to resync.",
-                local, remote
+                "WARNING: devlog binary is built from commit {} but GitHub master is at {}. \
+                 Run 'git pull' and reinstall.",
+                &local[..7.min(local.len())],
+                &remote[..7.min(remote.len())]
             );
         }
     }
 }
 
-fn fetch_github_version() -> Option<String> {
+fn fetch_github_master_sha() -> Option<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .ok()?;
-    let body = client.get(GITHUB_CARGO_TOML).send().ok()?.text().ok()?;
-    parse_version(&body)
-}
-
-fn parse_version(cargo_toml: &str) -> Option<String> {
-    cargo_toml
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("version"))
-        .and_then(|rest| rest.split('"').nth(1))
-        .map(|v| v.to_string())
+    let body = client
+        .get(GITHUB_COMMITS_API)
+        .header("User-Agent", "devlog-version-check")
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    json.get("sha")?.as_str().map(|s| s.to_string())
 }
