@@ -74,6 +74,8 @@ pub enum ConversationEntry {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<TokenUsage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     #[serde(rename = "tool_summary")]
     ToolSummary { actions: Vec<String> },
@@ -157,10 +159,12 @@ pub fn filter_to_conversation(entries: Vec<RawEntry>) -> Vec<ConversationEntry> 
                 let content = extract_content(&entry);
                 if !content.is_empty() {
                     let usage = extract_usage(&entry);
+                    let model = extract_model(&entry);
                     conversation.push(ConversationEntry::Assistant {
                         timestamp: entry.timestamp,
                         content,
                         usage,
+                        model,
                     });
                 }
 
@@ -254,6 +258,15 @@ fn extract_usage(entry: &RawEntry) -> Option<TokenUsage> {
     None
 }
 
+fn extract_model(entry: &RawEntry) -> Option<String> {
+    if let Some(MessageContent::Object(ref msg)) = entry.message {
+        if let Some(model) = msg.extra.get("model").and_then(|v| v.as_str()) {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
 fn summarize_tool_use(entry: &RawEntry) -> Option<String> {
     let tool_name = entry.tool.as_ref()?;
     let input = entry.input.as_ref();
@@ -336,5 +349,38 @@ fn truncate(s: &str, max_len: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max_len - 3])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_entry_captures_model_and_usage() {
+        let line = r#"{"type":"assistant","timestamp":"2026-06-12T10:00:00Z","message":{"model":"claude-fable-5","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":2000}}}"#;
+        let entry: RawEntry = serde_json::from_str(line).unwrap();
+        let conversation = filter_to_conversation(vec![entry]);
+
+        match &conversation[0] {
+            ConversationEntry::Assistant { model, usage, .. } => {
+                assert_eq!(model.as_deref(), Some("claude-fable-5"));
+                let usage = usage.as_ref().unwrap();
+                assert_eq!(usage.input_tokens, Some(100));
+                assert_eq!(usage.output_tokens, Some(50));
+            }
+            other => panic!("expected assistant entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assistant_entry_without_model_deserializes() {
+        // Stored devlogs from before model tracking have no model field
+        let stored = r#"{"type":"assistant","timestamp":null,"content":"hi","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#;
+        let entry: ConversationEntry = serde_json::from_str(stored).unwrap();
+        match entry {
+            ConversationEntry::Assistant { model, .. } => assert!(model.is_none()),
+            other => panic!("expected assistant entry, got {:?}", other),
+        }
     }
 }
