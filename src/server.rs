@@ -2,7 +2,7 @@ use crate::output::DevlogOutput;
 use crate::search::{self, SearchScope};
 use crate::stats;
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -39,6 +39,8 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         .route("/stats", get(stats_page))
         .route("/search", get(search_page))
         .route("/ingest", post(ingest))
+        // Long sessions exceed axum's 2MB default body limit
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);
