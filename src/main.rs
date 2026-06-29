@@ -2,6 +2,7 @@ mod parser;
 mod git;
 mod output;
 mod config;
+mod index;
 mod push;
 mod server;
 mod stats;

@@ -1,8 +1,6 @@
-use crate::output::DevlogOutput;
 use anyhow::Result;
+use rusqlite::{params, Connection};
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 
 pub struct ProjectStats {
     pub machine: String,
@@ -23,10 +21,41 @@ pub struct ProjectStats {
 
 impl ProjectStats {
     pub fn cost_usd(&self) -> f64 {
-        self.model_tokens
-            .iter()
-            .map(|(model, tokens)| estimate_cost(model, tokens))
-            .sum()
+        cost_of(&self.model_tokens)
+    }
+}
+
+/// One session row for the per-project drill-down page.
+pub struct SessionStats {
+    pub machine: String,
+    pub session_id: String,
+    pub last_activity: String,
+    pub prompt_count: usize,
+    pub tool_calls: usize,
+    pub model_tokens: HashMap<String, ModelTokens>,
+}
+
+impl SessionStats {
+    pub fn cost_usd(&self) -> f64 {
+        cost_of(&self.model_tokens)
+    }
+    pub fn totals(&self) -> ModelTokens {
+        sum_tokens(&self.model_tokens)
+    }
+}
+
+/// Token totals for one ISO week, for the trend table.
+pub struct WeeklyStats {
+    pub week: String,
+    pub model_tokens: HashMap<String, ModelTokens>,
+}
+
+impl WeeklyStats {
+    pub fn cost_usd(&self) -> f64 {
+        cost_of(&self.model_tokens)
+    }
+    pub fn totals(&self) -> ModelTokens {
+        sum_tokens(&self.model_tokens)
     }
 }
 
@@ -65,6 +94,24 @@ pub fn estimate_cost(model: &str, tokens: &ModelTokens) -> f64 {
         / 1_000_000.0
 }
 
+pub fn cost_of(model_tokens: &HashMap<String, ModelTokens>) -> f64 {
+    model_tokens
+        .iter()
+        .map(|(model, tokens)| estimate_cost(model, tokens))
+        .sum()
+}
+
+pub fn sum_tokens(model_tokens: &HashMap<String, ModelTokens>) -> ModelTokens {
+    let mut total = ModelTokens::default();
+    for tokens in model_tokens.values() {
+        total.input_tokens += tokens.input_tokens;
+        total.output_tokens += tokens.output_tokens;
+        total.cache_read_tokens += tokens.cache_read_tokens;
+        total.cache_write_tokens += tokens.cache_write_tokens;
+    }
+    total
+}
+
 fn merge_model_tokens(dest: &mut HashMap<String, ModelTokens>, src: &HashMap<String, ModelTokens>) {
     for (model, tokens) in src {
         let entry = dest.entry(model.clone()).or_default();
@@ -75,94 +122,83 @@ fn merge_model_tokens(dest: &mut HashMap<String, ModelTokens>, src: &HashMap<Str
     }
 }
 
-pub fn get_project_stats(storage_dir: &Path, days: u32) -> Result<Vec<ProjectStats>> {
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+fn cutoff_ts(days: u32) -> String {
+    (chrono::Utc::now() - chrono::Duration::days(days as i64))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+pub fn get_project_stats(conn: &Connection, days: u32) -> Result<Vec<ProjectStats>> {
+    let cutoff = cutoff_ts(days);
     let mut stats: HashMap<(String, String), ProjectStats> = HashMap::new();
 
-    if !storage_dir.exists() {
-        anyhow::bail!("Storage directory does not exist: {}", storage_dir.display());
+    let mut stmt = conn.prepare(
+        "SELECT machine, project, COUNT(*), SUM(prompts), SUM(tool_calls), SUM(files_touched),
+                SUM(prompt_words), SUM(response_words), MAX(last_activity)
+         FROM sessions WHERE last_activity >= ?1
+         GROUP BY machine, project",
+    )?;
+    let rows = stmt.query_map([&cutoff], |row| {
+        Ok(ProjectStats {
+            machine: row.get(0)?,
+            project: row.get(1)?,
+            session_count: row.get::<_, i64>(2)? as usize,
+            prompt_count: row.get::<_, i64>(3)? as usize,
+            tool_calls: row.get::<_, i64>(4)? as usize,
+            files_touched: row.get::<_, i64>(5)? as usize,
+            prompt_words: row.get::<_, i64>(6)? as usize,
+            response_words: row.get::<_, i64>(7)? as usize,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            model_tokens: HashMap::new(),
+            last_activity: row.get(8)?,
+        })
+    })?;
+    for row in rows {
+        let stat = row?;
+        stats.insert((stat.machine.clone(), stat.project.clone()), stat);
     }
 
-    // Walk storage directory: storage_dir/machine/project/*.json
-    for machine_entry in fs::read_dir(storage_dir)? {
-        let machine_entry = machine_entry?;
-        let machine_path = machine_entry.path();
-        if !machine_path.is_dir() {
-            continue;
-        }
-        let machine = machine_entry.file_name().to_string_lossy().to_string();
-
-        for project_entry in fs::read_dir(&machine_path)? {
-            let project_entry = project_entry?;
-            let project_path = project_entry.path();
-            if !project_path.is_dir() {
-                continue;
-            }
-            let project = project_entry.file_name().to_string_lossy().to_string();
-
-            for file_entry in fs::read_dir(&project_path)? {
-                let file_entry = file_entry?;
-                let file_path = file_entry.path();
-
-                if file_path.extension().map(|e| e == "json").unwrap_or(false) {
-                    if let Ok(devlog) = read_devlog(&file_path) {
-                        // Check if within date range
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&devlog.timestamp) {
-                            if dt < cutoff {
-                                continue;
-                            }
-                        }
-
-                        let key = (machine.clone(), project.clone());
-                        let entry = stats.entry(key).or_insert(ProjectStats {
-                            machine: machine.clone(),
-                            project: project.clone(),
-                            session_count: 0,
-                            prompt_count: 0,
-                            tool_calls: 0,
-                            files_touched: 0,
-                            prompt_words: 0,
-                            response_words: 0,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
-                            model_tokens: HashMap::new(),
-                            last_activity: String::new(),
-                        });
-
-                        entry.session_count += 1;
-                        let session_stats = analyze_session(&devlog);
-                        entry.prompt_count += session_stats.prompts;
-                        entry.tool_calls += session_stats.tool_calls;
-                        entry.files_touched += session_stats.files_touched;
-                        entry.prompt_words += session_stats.prompt_words;
-                        entry.response_words += session_stats.response_words;
-                        entry.input_tokens += session_stats.input_tokens;
-                        entry.output_tokens += session_stats.output_tokens;
-                        entry.cache_read_tokens += session_stats.cache_read_tokens;
-                        entry.cache_write_tokens += session_stats.cache_write_tokens;
-                        merge_model_tokens(&mut entry.model_tokens, &session_stats.model_tokens);
-
-                        if devlog.timestamp > entry.last_activity {
-                            entry.last_activity = devlog.timestamp.clone();
-                        }
-                    }
-                }
-            }
+    let mut stmt = conn.prepare(
+        "SELECT s.machine, s.project, u.model,
+                SUM(u.input_tokens), SUM(u.output_tokens), SUM(u.cache_read_tokens), SUM(u.cache_write_tokens)
+         FROM sessions s JOIN message_usage u ON u.session_rowid = s.id
+         WHERE s.last_activity >= ?1
+         GROUP BY s.machine, s.project, u.model",
+    )?;
+    let rows = stmt.query_map([&cutoff], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            ModelTokens {
+                input_tokens: row.get::<_, i64>(3)? as u64,
+                output_tokens: row.get::<_, i64>(4)? as u64,
+                cache_read_tokens: row.get::<_, i64>(5)? as u64,
+                cache_write_tokens: row.get::<_, i64>(6)? as u64,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (machine, project, model, tokens) = row?;
+        if let Some(stat) = stats.get_mut(&(machine, project)) {
+            stat.input_tokens += tokens.input_tokens;
+            stat.output_tokens += tokens.output_tokens;
+            stat.cache_read_tokens += tokens.cache_read_tokens;
+            stat.cache_write_tokens += tokens.cache_write_tokens;
+            stat.model_tokens.insert(model, tokens);
         }
     }
 
     let mut result: Vec<ProjectStats> = stats.into_values().collect();
-
-    // Sort by prompt count descending
     result.sort_by(|a, b| b.prompt_count.cmp(&a.prompt_count));
-
     Ok(result)
 }
 
-pub fn get_project_stats_grouped(storage_dir: &Path, days: u32) -> Result<Vec<ProjectStats>> {
-    let by_machine = get_project_stats(storage_dir, days)?;
+pub fn get_project_stats_grouped(conn: &Connection, days: u32) -> Result<Vec<ProjectStats>> {
+    let by_machine = get_project_stats(conn, days)?;
 
     // Aggregate by project name only
     let mut grouped: HashMap<String, ProjectStats> = HashMap::new();
@@ -214,95 +250,121 @@ pub fn get_project_stats_grouped(storage_dir: &Path, days: u32) -> Result<Vec<Pr
     Ok(result)
 }
 
-fn read_devlog(path: &Path) -> Result<DevlogOutput> {
-    let content = fs::read_to_string(path)?;
-    let devlog: DevlogOutput = serde_json::from_str(&content)?;
-    Ok(devlog)
+pub fn get_session_stats(conn: &Connection, project: &str, days: u32) -> Result<Vec<SessionStats>> {
+    let cutoff = cutoff_ts(days);
+
+    let mut stmt = conn.prepare(
+        "SELECT id, machine, session_id, last_activity, prompts, tool_calls
+         FROM sessions WHERE project = ?1 AND last_activity >= ?2
+         ORDER BY last_activity DESC",
+    )?;
+    let mut order: Vec<i64> = Vec::new();
+    let mut sessions: HashMap<i64, SessionStats> = HashMap::new();
+    let rows = stmt.query_map(params![project, cutoff], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            SessionStats {
+                machine: row.get(1)?,
+                session_id: row.get(2)?,
+                last_activity: row.get(3)?,
+                prompt_count: row.get::<_, i64>(4)? as usize,
+                tool_calls: row.get::<_, i64>(5)? as usize,
+                model_tokens: HashMap::new(),
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, session) = row?;
+        order.push(id);
+        sessions.insert(id, session);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT u.session_rowid, u.model,
+                SUM(u.input_tokens), SUM(u.output_tokens), SUM(u.cache_read_tokens), SUM(u.cache_write_tokens)
+         FROM message_usage u JOIN sessions s ON s.id = u.session_rowid
+         WHERE s.project = ?1 AND s.last_activity >= ?2
+         GROUP BY u.session_rowid, u.model",
+    )?;
+    let rows = stmt.query_map(params![project, cutoff], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            ModelTokens {
+                input_tokens: row.get::<_, i64>(2)? as u64,
+                output_tokens: row.get::<_, i64>(3)? as u64,
+                cache_read_tokens: row.get::<_, i64>(4)? as u64,
+                cache_write_tokens: row.get::<_, i64>(5)? as u64,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (id, model, tokens) = row?;
+        if let Some(session) = sessions.get_mut(&id) {
+            session.model_tokens.insert(model, tokens);
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .filter_map(|id| sessions.remove(&id))
+        .collect())
 }
 
-struct SessionStats {
-    prompts: usize,
-    tool_calls: usize,
-    files_touched: usize,
-    prompt_words: usize,
-    response_words: usize,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    model_tokens: HashMap<String, ModelTokens>,
-}
+/// Token totals per ISO week across all history (newest first), optionally
+/// filtered to one project. Buckets by per-message timestamps, so it works
+/// retroactively on everything ever ingested.
+pub fn get_weekly_stats(conn: &Connection, project: Option<&str>) -> Result<Vec<WeeklyStats>> {
+    let sql = format!(
+        "SELECT substr(u.ts, 1, 10), u.model,
+                SUM(u.input_tokens), SUM(u.output_tokens), SUM(u.cache_read_tokens), SUM(u.cache_write_tokens)
+         FROM message_usage u JOIN sessions s ON s.id = u.session_rowid
+         {}
+         GROUP BY 1, 2",
+        if project.is_some() { "WHERE s.project = ?1" } else { "" }
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
-fn analyze_session(devlog: &DevlogOutput) -> SessionStats {
-    use crate::parser::ConversationEntry;
-    use std::collections::HashSet;
-
-    let mut stats = SessionStats {
-        prompts: 0,
-        tool_calls: 0,
-        files_touched: 0,
-        prompt_words: 0,
-        response_words: 0,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        model_tokens: HashMap::new(),
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<(String, String, ModelTokens)> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            ModelTokens {
+                input_tokens: row.get::<_, i64>(2)? as u64,
+                output_tokens: row.get::<_, i64>(3)? as u64,
+                cache_read_tokens: row.get::<_, i64>(4)? as u64,
+                cache_write_tokens: row.get::<_, i64>(5)? as u64,
+            },
+        ))
+    };
+    let rows: Vec<(String, String, ModelTokens)> = match project {
+        Some(p) => stmt.query_map([p], map_row)?.collect::<rusqlite::Result<_>>()?,
+        None => stmt.query_map([], map_row)?.collect::<rusqlite::Result<_>>()?,
     };
 
-    let mut files: HashSet<String> = HashSet::new();
-
-    for entry in &devlog.conversation {
-        match entry {
-            ConversationEntry::User { content, .. } => {
-                stats.prompts += 1;
-                stats.prompt_words += count_words(content);
+    let mut weeks: HashMap<String, HashMap<String, ModelTokens>> = HashMap::new();
+    for (day, model, tokens) in rows {
+        let week = match chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d") {
+            Ok(date) => {
+                use chrono::Datelike;
+                let iso = date.iso_week();
+                format!("{}-W{:02}", iso.year(), iso.week())
             }
-            ConversationEntry::Assistant { content, usage, model, .. } => {
-                stats.response_words += count_words(content);
-                if let Some(ref usage) = usage {
-                    stats.input_tokens += usage.input_tokens.unwrap_or(0);
-                    stats.output_tokens += usage.output_tokens.unwrap_or(0);
-                    stats.cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-                    stats.cache_write_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
-
-                    let model_name = model.as_deref().unwrap_or("unknown").to_string();
-                    let per_model = stats.model_tokens.entry(model_name).or_default();
-                    per_model.input_tokens += usage.input_tokens.unwrap_or(0);
-                    per_model.output_tokens += usage.output_tokens.unwrap_or(0);
-                    per_model.cache_read_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-                    per_model.cache_write_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
-                }
-            }
-            ConversationEntry::ToolSummary { actions } => {
-                stats.tool_calls += actions.len();
-                // Extract file paths from tool actions
-                for action in actions {
-                    if let Some(file) = extract_file_from_action(action) {
-                        files.insert(file);
-                    }
-                }
-            }
-        }
+            Err(_) => "unknown".to_string(),
+        };
+        let entry = weeks.entry(week).or_default().entry(model).or_default();
+        entry.input_tokens += tokens.input_tokens;
+        entry.output_tokens += tokens.output_tokens;
+        entry.cache_read_tokens += tokens.cache_read_tokens;
+        entry.cache_write_tokens += tokens.cache_write_tokens;
     }
 
-    stats.files_touched = files.len();
-    stats
-}
-
-fn count_words(text: &str) -> usize {
-    text.split_whitespace().count()
-}
-
-fn extract_file_from_action(action: &str) -> Option<String> {
-    // Actions look like: "edited src/main.rs", "read config.json", "created foo.txt"
-    let prefixes = ["edited ", "read ", "created "];
-    for prefix in prefixes {
-        if action.starts_with(prefix) {
-            return Some(action[prefix.len()..].to_string());
-        }
-    }
-    None
+    let mut result: Vec<WeeklyStats> = weeks
+        .into_iter()
+        .map(|(week, model_tokens)| WeeklyStats { week, model_tokens })
+        .collect();
+    result.sort_by(|a, b| b.week.cmp(&a.week));
+    Ok(result)
 }
 
 #[cfg(test)]

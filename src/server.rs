@@ -1,3 +1,4 @@
+use crate::index;
 use crate::output::DevlogOutput;
 use crate::search::{self, SearchScope};
 use crate::stats;
@@ -10,7 +11,7 @@ use axum::{
 };
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -27,11 +28,25 @@ impl Default for ServerConfig {
     }
 }
 
+pub struct AppState {
+    pub config: ServerConfig,
+    pub db: Mutex<rusqlite::Connection>,
+}
+
 pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
     // Ensure storage directory exists
     fs::create_dir_all(&config.storage_dir)?;
 
-    let state = Arc::new(config.clone());
+    let mut db = index::open(&config.storage_dir)?;
+    let indexed = index::backfill(&mut db, &config.storage_dir)?;
+    if indexed > 0 {
+        eprintln!("Indexed {} devlog files into stats index", indexed);
+    }
+
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        db: Mutex::new(db),
+    });
 
     let app = Router::new()
         .route("/", get(index))
@@ -98,6 +113,7 @@ a {{ color: #00d9ff; }}
 #[derive(serde::Deserialize)]
 struct StatsQuery {
     days: Option<u32>,
+    project: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -123,20 +139,37 @@ where
 use serde::Deserialize;
 
 async fn stats_page(
-    State(config): State<Arc<ServerConfig>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<StatsQuery>,
 ) -> impl IntoResponse {
     let days = query.days.unwrap_or(7);
+    let db = state.db.lock().expect("stats db lock poisoned");
 
-    let grouped = stats::get_project_stats_grouped(&config.storage_dir, days);
-    let by_machine = stats::get_project_stats(&config.storage_dir, days);
+    if let Some(project) = query.project.as_deref() {
+        let sessions = stats::get_session_stats(&db, project, days);
+        let weekly = stats::get_weekly_stats(&db, Some(project));
+        return match (sessions, weekly) {
+            (Ok(sessions), Ok(weekly)) => {
+                let html = render_project_html(project, &sessions, &weekly, days);
+                (StatusCode::OK, Html(html))
+            }
+            (Err(e), _) | (_, Err(e)) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(format!("<h1>Error</h1><p>{}</p>", e)),
+            ),
+        };
+    }
 
-    match (grouped, by_machine) {
-        (Ok(grouped_stats), Ok(machine_stats)) => {
-            let html = render_stats_html(&grouped_stats, &machine_stats, days);
+    let grouped = stats::get_project_stats_grouped(&db, days);
+    let by_machine = stats::get_project_stats(&db, days);
+    let weekly = stats::get_weekly_stats(&db, None);
+
+    match (grouped, by_machine, weekly) {
+        (Ok(grouped_stats), Ok(machine_stats), Ok(weekly_stats)) => {
+            let html = render_stats_html(&grouped_stats, &machine_stats, &weekly_stats, days);
             (StatusCode::OK, Html(html))
         }
-        (Err(e), _) | (_, Err(e)) => (
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Html(format!("<h1>Error</h1><p>{}</p>", e)),
         ),
@@ -146,6 +179,7 @@ async fn stats_page(
 fn render_stats_html(
     grouped: &[stats::ProjectStats],
     by_machine: &[stats::ProjectStats],
+    weekly: &[stats::WeeklyStats],
     days: u32,
 ) -> String {
     let mut html = format!(
@@ -199,7 +233,7 @@ a {{ color: #00d9ff; }}
     } else {
         html.push_str(
             r#"<table>
-<tr><th>Project</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Files</th><th class="number">Words In</th><th class="number">Words Out</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th class="number">Est. Cost</th><th>Last Activity</th></tr>
+<tr><th>Project</th><th class="number">Sessions</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Files</th><th class="number">Words In</th><th class="number">Words Out</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th class="number">Cache R/Prompt</th><th class="number">Est. Cost</th><th>Last Activity</th></tr>
 "#,
         );
 
@@ -210,9 +244,12 @@ a {{ color: #00d9ff; }}
 
             // Parent row (grouped)
             html.push_str(&format!(
-                "<tr class=\"parent\" data-idx=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"parent\" data-idx=\"{}\"><td><a href=\"stats?project={}&days={}\">{}</a></td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                 idx,
+                urlencoding(&stat.project),
+                days,
                 html_escape(&stat.project),
+                stat.session_count,
                 stat.prompt_count,
                 stat.tool_calls,
                 stat.files_touched,
@@ -221,6 +258,7 @@ a {{ color: #00d9ff; }}
                 format_tokens(stat.input_tokens),
                 format_tokens(stat.output_tokens),
                 format_cache_tokens(stat.cache_read_tokens, stat.cache_write_tokens),
+                format_per_prompt(stat.cache_read_tokens, stat.prompt_count),
                 format_cost(stat.cost_usd()),
                 last
             ));
@@ -232,9 +270,10 @@ a {{ color: #00d9ff; }}
                     .unwrap_or_else(|_| machine_stat.last_activity.clone());
 
                 html.push_str(&format!(
-                    "<tr class=\"child\" data-parent=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                    "<tr class=\"child\" data-parent=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                     idx,
                     html_escape(&machine_stat.machine),
+                    machine_stat.session_count,
                     machine_stat.prompt_count,
                     machine_stat.tool_calls,
                     machine_stat.files_touched,
@@ -243,12 +282,14 @@ a {{ color: #00d9ff; }}
                     format_tokens(machine_stat.input_tokens),
                     format_tokens(machine_stat.output_tokens),
                     format_cache_tokens(machine_stat.cache_read_tokens, machine_stat.cache_write_tokens),
+                    format_per_prompt(machine_stat.cache_read_tokens, machine_stat.prompt_count),
                     format_cost(machine_stat.cost_usd()),
                     m_last
                 ));
             }
         }
 
+        let total_sessions: usize = grouped.iter().map(|s| s.session_count).sum();
         let total_prompts: usize = grouped.iter().map(|s| s.prompt_count).sum();
         let total_tools: usize = grouped.iter().map(|s| s.tool_calls).sum();
         let total_files: usize = grouped.iter().map(|s| s.files_touched).sum();
@@ -261,7 +302,8 @@ a {{ color: #00d9ff; }}
         let total_cost: f64 = grouped.iter().map(|s| s.cost_usd()).sum();
 
         html.push_str(&format!(
-            "<tr class=\"totals\"><td>Total</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td></td></tr>\n",
+            "<tr class=\"totals\"><td>Total</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td></td></tr>\n",
+            total_sessions,
             total_prompts,
             total_tools,
             total_files,
@@ -270,6 +312,7 @@ a {{ color: #00d9ff; }}
             format_tokens(total_input_tokens),
             format_tokens(total_output_tokens),
             format_cache_tokens(total_cache_read, total_cache_write),
+            format_per_prompt(total_cache_read, total_prompts),
             format_cost(total_cost),
         ));
         html.push_str("</table>");
@@ -288,6 +331,7 @@ a {{ color: #00d9ff; }}
         ));
 
         html.push_str(&render_model_breakdown(grouped));
+        html.push_str(&render_weekly_table(weekly));
     }
 
     html.push_str(r#"
@@ -311,6 +355,176 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Minimal percent-encoding for a query-string value (project names are
+/// directory names, but spaces/&/# would still break the URL).
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+fn format_per_prompt(tokens: u64, prompts: usize) -> String {
+    if prompts == 0 {
+        "-".to_string()
+    } else {
+        format_tokens(tokens / prompts as u64)
+    }
+}
+
+/// Per-project drill-down: one row per session, plus the project's weekly trend.
+fn render_project_html(
+    project: &str,
+    sessions: &[stats::SessionStats],
+    weekly: &[stats::WeeklyStats],
+    days: u32,
+) -> String {
+    let mut html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<title>Devlog Stats — {project}</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }}
+h1, h2 {{ color: #00d9ff; }}
+table {{ border-collapse: collapse; width: 100%; max-width: 1400px; }}
+th, td {{ padding: 0.5rem 1rem; text-align: left; border-bottom: 1px solid #333; white-space: nowrap; }}
+th {{ background: #16213e; color: #00d9ff; }}
+tr:hover {{ background: #16213e; }}
+tr.totals td {{ font-weight: bold; background: #16213e; border-top: 2px solid #00d9ff; }}
+.number {{ text-align: right; font-variant-numeric: tabular-nums; }}
+a {{ color: #00d9ff; }}
+.filter {{ margin-bottom: 1rem; display: flex; gap: 0.5rem; }}
+.filter a {{ padding: 0.3rem 0.8rem; background: #16213e; text-decoration: none; border-radius: 4px; }}
+.filter a:hover, .filter a.active {{ background: #00d9ff; color: #1a1a2e; }}
+.session-id {{ color: #888; font-size: 0.85em; }}
+{nav_style}
+</style>
+</head>
+<body>
+{nav}
+<h1>Project: {project}</h1>
+<p><a href="stats?days={days}">&larr; All projects</a></p>
+<div class="filter">
+  <a href="stats?project={proj_url}&days=1" {d1}>Today</a>
+  <a href="stats?project={proj_url}&days=7" {d7}>7 days</a>
+  <a href="stats?project={proj_url}&days=30" {d30}>30 days</a>
+  <a href="stats?project={proj_url}&days=90" {d90}>90 days</a>
+  <a href="stats?project={proj_url}&days=3650" {dall}>All time</a>
+</div>
+"#,
+        project = html_escape(project),
+        proj_url = urlencoding(project),
+        nav_style = NAV_STYLE,
+        nav = nav_html("stats"),
+        days = days,
+        d1 = if days == 1 { "class=\"active\"" } else { "" },
+        d7 = if days == 7 { "class=\"active\"" } else { "" },
+        d30 = if days == 30 { "class=\"active\"" } else { "" },
+        d90 = if days == 90 { "class=\"active\"" } else { "" },
+        dall = if days == 3650 { "class=\"active\"" } else { "" },
+    );
+
+    if sessions.is_empty() {
+        html.push_str(&format!(
+            "<p>No sessions in the last {} days</p>",
+            days
+        ));
+    } else {
+        html.push_str(
+            r#"<table>
+<tr><th>Last Activity</th><th>Machine</th><th>Session</th><th class="number">Prompts</th><th class="number">Tools</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th class="number">Cache R/Prompt</th><th class="number">Est. Cost</th></tr>
+"#,
+        );
+
+        let mut total = stats::ModelTokens::default();
+        let mut total_prompts = 0usize;
+        let mut total_tools = 0usize;
+        let mut total_cost = 0.0f64;
+
+        for session in sessions {
+            let last = chrono::DateTime::parse_from_rfc3339(&session.last_activity)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|_| session.last_activity.clone());
+            let tokens = session.totals();
+            let cost = session.cost_usd();
+            let short_id: String = session.session_id.chars().take(8).collect();
+
+            html.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td class=\"session-id\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td></tr>\n",
+                last,
+                html_escape(&session.machine),
+                html_escape(&short_id),
+                session.prompt_count,
+                session.tool_calls,
+                format_tokens(tokens.input_tokens),
+                format_tokens(tokens.output_tokens),
+                format_cache_tokens(tokens.cache_read_tokens, tokens.cache_write_tokens),
+                format_per_prompt(tokens.cache_read_tokens, session.prompt_count),
+                format_cost(cost),
+            ));
+
+            total.input_tokens += tokens.input_tokens;
+            total.output_tokens += tokens.output_tokens;
+            total.cache_read_tokens += tokens.cache_read_tokens;
+            total.cache_write_tokens += tokens.cache_write_tokens;
+            total_prompts += session.prompt_count;
+            total_tools += session.tool_calls;
+            total_cost += cost;
+        }
+
+        html.push_str(&format!(
+            "<tr class=\"totals\"><td>Total</td><td></td><td>{} sessions</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td></tr>\n",
+            sessions.len(),
+            total_prompts,
+            total_tools,
+            format_tokens(total.input_tokens),
+            format_tokens(total.output_tokens),
+            format_cache_tokens(total.cache_read_tokens, total.cache_write_tokens),
+            format_per_prompt(total.cache_read_tokens, total_prompts),
+            format_cost(total_cost),
+        ));
+        html.push_str("</table>");
+    }
+
+    html.push_str(&render_weekly_table(weekly));
+    html.push_str("</body></html>");
+    html
+}
+
+/// Weekly trend across all history (not affected by the days filter).
+fn render_weekly_table(weekly: &[stats::WeeklyStats]) -> String {
+    if weekly.is_empty() {
+        return String::new();
+    }
+
+    let mut html = String::from(
+        r#"<h2>By Week (all history)</h2>
+<table>
+<tr><th>Week</th><th class="number">Tokens In</th><th class="number">Tokens Out</th><th class="number">Cache R/W</th><th class="number">Est. Cost</th></tr>
+"#,
+    );
+    for week in weekly {
+        let tokens = week.totals();
+        html.push_str(&format!(
+            "<tr><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td></tr>\n",
+            html_escape(&week.week),
+            format_tokens(tokens.input_tokens),
+            format_tokens(tokens.output_tokens),
+            format_cache_tokens(tokens.cache_read_tokens, tokens.cache_write_tokens),
+            format_cost(week.cost_usd()),
+        ));
+    }
+    html.push_str("</table>");
+    html
 }
 
 fn format_number(n: usize) -> String {
@@ -399,7 +613,7 @@ fn format_cache_tokens(read: u64, write: u64) -> String {
 }
 
 async fn search_page(
-    State(config): State<Arc<ServerConfig>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<SearchQuery>,
 ) -> impl IntoResponse {
     let scope = query
@@ -412,7 +626,7 @@ async fn search_page(
         if q.trim().is_empty() {
             Ok(Vec::new())
         } else {
-            search::search_devlogs(&config.storage_dir, q, scope, query.days, 50)
+            search::search_devlogs(&state.config.storage_dir, q, scope, query.days, 50)
         }
     });
 
@@ -584,12 +798,17 @@ fn highlight_match(snippet: &str, query: &str) -> String {
 }
 
 async fn ingest(
-    State(config): State<Arc<ServerConfig>>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<DevlogOutput>,
 ) -> impl IntoResponse {
-    match store_devlog(&config.storage_dir, &payload) {
+    match store_devlog(&state.config.storage_dir, &payload) {
         Ok(path) => {
             eprintln!("Stored devlog: {}", path.display());
+            if let Err(e) = index_stored_devlog(&state, &path, &payload) {
+                // The raw file is stored; the index will pick it up via
+                // backfill on the next restart, so don't fail the ingest.
+                eprintln!("Failed to index devlog (will backfill on restart): {}", e);
+            }
             (StatusCode::OK, format!("Stored: {}", path.display()))
         }
         Err(e) => {
@@ -597,6 +816,21 @@ async fn ingest(
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e))
         }
     }
+}
+
+fn index_stored_devlog(
+    state: &AppState,
+    stored_path: &std::path::Path,
+    payload: &DevlogOutput,
+) -> anyhow::Result<()> {
+    let machine = payload.machine_id.clone();
+    let project = extract_project_name(&payload.project_dir);
+    let db = state.db.lock().expect("stats db lock poisoned");
+    index::upsert_devlog(&db, &machine, &project, payload)?;
+    if let Ok(rel) = stored_path.strip_prefix(&state.config.storage_dir) {
+        index::mark_file_indexed(&db, &rel.to_string_lossy().replace('\\', "/"))?;
+    }
+    Ok(())
 }
 
 fn store_devlog(storage_dir: &PathBuf, output: &DevlogOutput) -> anyhow::Result<PathBuf> {

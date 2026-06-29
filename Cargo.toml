@@ -1,6 +1,6 @@
 [package]
 name = "devlog"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Claude Code session ingester - captures conversations for later reference"
 
@@ -17,3 +17,4 @@ toml = "0.8"
 serde_derive = "1.0"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
