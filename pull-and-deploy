@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Pull the latest master and reinstall the devlog binary.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+git pull
+make install
