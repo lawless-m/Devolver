@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -52,6 +52,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/health", get(health))
         .route("/stats", get(stats_page))
+        .route("/session", get(session_page))
         .route("/search", get(search_page))
         .route("/ingest", post(ingest))
         // Long sessions exceed axum's 2MB default body limit
@@ -114,6 +115,17 @@ a {{ color: #00d9ff; }}
 struct StatsQuery {
     days: Option<u32>,
     project: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SessionViewQuery {
+    machine: String,
+    project: String,
+    session: String,
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    days: Option<u32>,
+    /// "prompts" | "replies" (default) | "all"
+    view: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -242,12 +254,11 @@ a {{ color: #00d9ff; }}
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|_| stat.last_activity.clone());
 
-            // Parent row (grouped)
+            // Parent row (grouped). The name is plain text; clicking the row
+            // toggles the dropdown, which holds the link into the sessions.
             html.push_str(&format!(
-                "<tr class=\"parent\" data-idx=\"{}\"><td><a href=\"stats?project={}&days={}\">{}</a></td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"parent\" data-idx=\"{}\"><td>{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td>{}</td></tr>\n",
                 idx,
-                urlencoding(&stat.project),
-                days,
                 html_escape(&stat.project),
                 stat.session_count,
                 stat.prompt_count,
@@ -261,6 +272,15 @@ a {{ color: #00d9ff; }}
                 format_per_prompt(stat.cache_read_tokens, stat.prompt_count),
                 format_cost(stat.cost_usd()),
                 last
+            ));
+
+            // First dropdown row: the link into this project's sessions.
+            html.push_str(&format!(
+                "<tr class=\"child sessions-link\" data-parent=\"{}\"><td colspan=\"13\"><a href=\"stats?project={}&days={}\">Browse {} sessions &rarr;</a></td></tr>\n",
+                idx,
+                urlencoding(&stat.project),
+                days,
+                stat.session_count,
             ));
 
             // Child rows (by machine for this project)
@@ -457,11 +477,19 @@ a {{ color: #00d9ff; }}
             let tokens = session.totals();
             let cost = session.cost_usd();
             let short_id: String = session.session_id.chars().take(8).collect();
+            let session_link = format!(
+                "session?machine={}&project={}&session={}&days={}",
+                urlencoding(&session.machine),
+                urlencoding(project),
+                urlencoding(&session.session_id),
+                days,
+            );
 
             html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td class=\"session-id\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td></tr>\n",
+                "<tr><td>{}</td><td>{}</td><td class=\"session-id\"><a href=\"{}\">{}</a></td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td><td class=\"number\">{}</td></tr>\n",
                 last,
                 html_escape(&session.machine),
+                session_link,
                 html_escape(&short_id),
                 session.prompt_count,
                 session.tool_calls,
@@ -610,6 +638,279 @@ fn format_cache_tokens(read: u64, write: u64) -> String {
     } else {
         format!("{}/{}", format_tokens(read), format_tokens(write))
     }
+}
+
+async fn session_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionViewQuery>,
+) -> impl IntoResponse {
+    let devlog = load_session(
+        &state.config.storage_dir,
+        &query.machine,
+        &query.project,
+        &query.session,
+    );
+
+    match devlog {
+        Some(devlog) => {
+            let (newer, older) = {
+                let db = state.db.lock().expect("stats db lock poisoned");
+                session_neighbors(&db, &query.project, &query.machine, &query.session)
+            };
+            let html = render_session_html(&query, &devlog, newer, older);
+            (StatusCode::OK, Html(html))
+        }
+        None => {
+            let days = query.days.unwrap_or(7);
+            let html = format!(
+                "<!DOCTYPE html><html><head><title>Session not found</title><style>\
+                 body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }}\
+                 a {{ color: #00d9ff; }}</style></head><body>\
+                 <h1>Session not found</h1>\
+                 <p>No stored transcript for session <code>{}</code> in project {} on {}.</p>\
+                 <p><a href=\"stats?project={}&days={}\">&larr; Back to {}</a></p>\
+                 </body></html>",
+                html_escape(&query.session),
+                html_escape(&query.project),
+                html_escape(&query.machine),
+                urlencoding(&query.project),
+                days,
+                html_escape(&query.project),
+            );
+            (StatusCode::NOT_FOUND, Html(html))
+        }
+    }
+}
+
+/// Locate and parse the newest stored transcript for a session. Files are named
+/// `<timestamp>-<session_id[..8]>.json`, so a lexical sort orders them by time;
+/// we take the newest whose full session_id matches (guards the rare 8-char
+/// prefix collision), which is also the ingest the stats index keeps.
+fn load_session(
+    storage_dir: &Path,
+    machine: &str,
+    project: &str,
+    session_id: &str,
+) -> Option<DevlogOutput> {
+    let dir = storage_dir.join(machine).join(project);
+    let short: String = session_id.chars().take(8).collect();
+    let suffix = format!("-{}.json", short);
+
+    let mut candidates: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(&suffix))
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+
+    for path in candidates.into_iter().rev() {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(devlog) = serde_json::from_str::<DevlogOutput>(&content) {
+                if devlog.session_id == session_id {
+                    return Some(devlog);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The sessions immediately newer and older than this one within the same
+/// project (the drill-down ordering), for prev/next browsing. Each is
+/// (machine, session_id).
+fn session_neighbors(
+    db: &rusqlite::Connection,
+    project: &str,
+    machine: &str,
+    session_id: &str,
+) -> (Option<(String, String)>, Option<(String, String)>) {
+    // Ordered newest-first, across all history.
+    let sessions = stats::get_session_stats(db, project, 3650).unwrap_or_default();
+    let pos = sessions
+        .iter()
+        .position(|s| s.session_id == session_id && s.machine == machine);
+    match pos {
+        Some(i) => {
+            let newer = i
+                .checked_sub(1)
+                .and_then(|j| sessions.get(j))
+                .map(|s| (s.machine.clone(), s.session_id.clone()));
+            let older = sessions
+                .get(i + 1)
+                .map(|s| (s.machine.clone(), s.session_id.clone()));
+            (newer, older)
+        }
+        None => (None, None),
+    }
+}
+
+/// One session's full conversation, filterable to prompts / prompts+replies /
+/// everything so it can be shown to someone as "what I asked → what I got".
+fn render_session_html(
+    query: &SessionViewQuery,
+    devlog: &DevlogOutput,
+    newer: Option<(String, String)>,
+    older: Option<(String, String)>,
+) -> String {
+    use crate::parser::ConversationEntry;
+
+    let view = query.view.as_deref().unwrap_or("replies");
+    let days = query.days.unwrap_or(7);
+    let short_id: String = devlog.session_id.chars().take(8).collect();
+
+    // Preserve machine/project/session/days when switching the view filter.
+    let base = format!(
+        "session?machine={}&project={}&session={}&days={}",
+        urlencoding(&query.machine),
+        urlencoding(&query.project),
+        urlencoding(&query.session),
+        days,
+    );
+    let neighbor_link = |m: &str, s: &str| {
+        format!(
+            "session?machine={}&project={}&session={}&days={}&view={}",
+            urlencoding(m),
+            urlencoding(&query.project),
+            urlencoding(s),
+            days,
+            view,
+        )
+    };
+
+    let mut html = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+<title>Session {short_id} — {project}</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #eee; }}
+h1, h2 {{ color: #00d9ff; }}
+a {{ color: #00d9ff; }}
+.meta {{ color: #888; margin-bottom: 1rem; }}
+.filter {{ margin-bottom: 1.5rem; display: flex; gap: 0.5rem; align-items: center; }}
+.filter a {{ padding: 0.3rem 0.8rem; background: #16213e; text-decoration: none; border-radius: 4px; }}
+.filter a:hover, .filter a.active {{ background: #00d9ff; color: #1a1a2e; }}
+.turns {{ max-width: 900px; }}
+.turn {{ margin-bottom: 1rem; padding: 0.8rem 1rem; border-radius: 8px; }}
+.turn .role {{ font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; color: #888; }}
+.turn .body {{ white-space: pre-wrap; word-break: break-word; line-height: 1.5; }}
+.user {{ background: #1c3a1c; border-left: 3px solid #4caf50; }}
+.user .role {{ color: #8f8; }}
+.assistant {{ background: #16213e; border-left: 3px solid #00d9ff; }}
+.assistant .role {{ color: #00d9ff; }}
+.tool {{ background: #2a2a16; border-left: 3px solid #d4c400; font-size: 0.9rem; }}
+.tool .role {{ color: #ff8; }}
+.tool ul {{ margin: 0; padding-left: 1.2rem; color: #ccc; }}
+.model {{ font-size: 0.75rem; color: #666; }}
+.pager {{ display: flex; justify-content: space-between; margin: 1.5rem 0; }}
+.pager a {{ padding: 0.4rem 0.9rem; background: #16213e; text-decoration: none; border-radius: 4px; }}
+.pager a:hover {{ background: #00d9ff; color: #1a1a2e; }}
+.pager .spacer {{ visibility: hidden; }}
+{nav_style}
+</style>
+</head>
+<body>
+{nav}
+<h1>Session {short_id}</h1>
+<div class="meta">
+  <a href="stats?project={proj_url}&days={days}">&larr; {project}</a>
+  &nbsp;·&nbsp; {machine}
+  &nbsp;·&nbsp; {session_id}
+</div>
+<div class="filter">
+  <span>Show:</span>
+  <a href="{base}&view=prompts" {p_active}>My prompts</a>
+  <a href="{base}&view=replies" {r_active}>Prompts &amp; replies</a>
+  <a href="{base}&view=all" {a_active}>Everything</a>
+</div>
+"#,
+        short_id = html_escape(&short_id),
+        project = html_escape(&query.project),
+        proj_url = urlencoding(&query.project),
+        machine = html_escape(&query.machine),
+        session_id = html_escape(&devlog.session_id),
+        days = days,
+        base = base,
+        nav_style = NAV_STYLE,
+        nav = nav_html("stats"),
+        p_active = if view == "prompts" { "class=\"active\"" } else { "" },
+        r_active = if view == "replies" { "class=\"active\"" } else { "" },
+        a_active = if view == "all" { "class=\"active\"" } else { "" },
+    );
+
+    html.push_str("<div class=\"turns\">\n");
+    let mut shown = 0usize;
+    for entry in &devlog.conversation {
+        match entry {
+            ConversationEntry::User { content, .. } => {
+                shown += 1;
+                html.push_str(&format!(
+                    "<div class=\"turn user\"><div class=\"role\">You</div><div class=\"body\">{}</div></div>\n",
+                    html_escape(content),
+                ));
+            }
+            ConversationEntry::Assistant { content, model, .. } => {
+                if view == "prompts" {
+                    continue;
+                }
+                shown += 1;
+                let model_line = model
+                    .as_deref()
+                    .map(|m| format!("<span class=\"model\"> · {}</span>", html_escape(m)))
+                    .unwrap_or_default();
+                html.push_str(&format!(
+                    "<div class=\"turn assistant\"><div class=\"role\">Claude{}</div><div class=\"body\">{}</div></div>\n",
+                    model_line,
+                    html_escape(content),
+                ));
+            }
+            ConversationEntry::ToolSummary { actions } => {
+                if view != "all" {
+                    continue;
+                }
+                shown += 1;
+                let items: String = actions
+                    .iter()
+                    .map(|a| format!("<li>{}</li>", html_escape(a)))
+                    .collect();
+                html.push_str(&format!(
+                    "<div class=\"turn tool\"><div class=\"role\">Tools</div><ul>{}</ul></div>\n",
+                    items,
+                ));
+            }
+        }
+    }
+    if shown == 0 {
+        html.push_str("<p class=\"meta\">Nothing to show for this filter.</p>");
+    }
+    html.push_str("</div>\n");
+
+    // Newer/older pager (newest-first ordering, so "newer" is the previous row).
+    html.push_str("<div class=\"pager\">");
+    match &newer {
+        Some((m, s)) => html.push_str(&format!(
+            "<a href=\"{}\">&larr; Newer session</a>",
+            neighbor_link(m, s)
+        )),
+        None => html.push_str("<span class=\"spacer\">placeholder</span>"),
+    }
+    match &older {
+        Some((m, s)) => html.push_str(&format!(
+            "<a href=\"{}\">Older session &rarr;</a>",
+            neighbor_link(m, s)
+        )),
+        None => html.push_str("<span class=\"spacer\">placeholder</span>"),
+    }
+    html.push_str("</div>\n");
+
+    html.push_str("</body></html>");
+    html
 }
 
 async fn search_page(
