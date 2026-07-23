@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DevlogOutput {
@@ -17,43 +17,77 @@ pub struct DevlogOutput {
     pub conversation: Vec<ConversationEntry>,
 }
 
-/// Write the devlog output to the .devlog directory
+/// Write the devlog output. Preferred location is the project's own `.devlog/`
+/// so the narrative lives alongside the code. If that directory can't be written
+/// — e.g. the session ran in a root-owned path like `/etc/...` — fall back to
+/// `~/.devlog/sessions/<project>/` so the session is never lost.
 pub fn write_output(output: &DevlogOutput) -> Result<PathBuf> {
-    // Determine output directory
-    let output_dir = get_output_dir(&output.project_dir)?;
-
-    // Ensure directory exists
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
-
-    // Self-register .devlog in the project's .gitignore so the captured logs
-    // never show up as untracked. Only inside a git repo, and best-effort — a
-    // .gitignore failure must not abort the ingest.
-    if output.git.is_some() {
-        if let Err(e) = ensure_gitignored(&output.project_dir) {
-            eprintln!("Warning: could not update .gitignore: {}", e);
-        }
-    }
-
-    // Generate filename: YYYY-MM-DD-HHMMSS-<session_id_short>.json
     let filename = generate_filename(&output.session_id);
-    let output_path = output_dir.join(&filename);
-
-    // Serialize to JSON
     let json = serde_json::to_string_pretty(output).context("Failed to serialize output")?;
 
-    // Write to file
-    fs::write(&output_path, json)
-        .with_context(|| format!("Failed to write output file: {}", output_path.display()))?;
+    // Preferred: alongside the code, in the project's own .devlog/.
+    let primary = get_output_dir(&output.project_dir)?;
+    match try_write(&primary, &filename, &json) {
+        Ok(path) => {
+            // Self-register .devlog in the project's .gitignore so the captured
+            // logs never show up as untracked. In-repo only, and best-effort.
+            if output.git.is_some() {
+                if let Err(e) = ensure_gitignored(&output.project_dir) {
+                    eprintln!("Warning: could not update .gitignore: {}", e);
+                }
+            }
+            eprintln!("Wrote devlog to: {}", path.display());
+            Ok(path)
+        }
+        Err(e) => {
+            // Project dir not writable (permission denied, read-only fs, …).
+            // Never lose the session: write to a home-based fallback instead.
+            let fallback = fallback_output_dir(&output.project_dir)?;
+            eprintln!(
+                "Warning: could not write to {} ({}); falling back to {}",
+                primary.display(),
+                e,
+                fallback.display()
+            );
+            let path = try_write(&fallback, &filename, &json)?;
+            eprintln!("Wrote devlog to: {}", path.display());
+            Ok(path)
+        }
+    }
+}
 
-    eprintln!("Wrote devlog to: {}", output_path.display());
-    Ok(output_path)
+/// Create `dir` (if needed) and write `filename` into it. Returns the full path.
+fn try_write(dir: &Path, filename: &str, json: &str) -> Result<PathBuf> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create output directory: {}", dir.display()))?;
+    let path = dir.join(filename);
+    fs::write(&path, json)
+        .with_context(|| format!("Failed to write output file: {}", path.display()))?;
+    Ok(path)
 }
 
 fn get_output_dir(project_dir: &str) -> Result<PathBuf> {
     let mut path = PathBuf::from(project_dir);
     path.push(".devlog");
     Ok(path)
+}
+
+/// Guaranteed-writable fallback: `~/.devlog/sessions/<munged-project-dir>/`.
+/// The project path is flattened to a single directory name (like Claude Code
+/// munges cwd), so sessions from different projects don't collide.
+fn fallback_output_dir(project_dir: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let munged: String = project_dir
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        .collect();
+    let munged = munged.trim_matches('-');
+    let munged = if munged.is_empty() { "root" } else { munged };
+    Ok(PathBuf::from(home)
+        .join(".devlog")
+        .join("sessions")
+        .join(munged))
 }
 
 /// Ensure the project's `.gitignore` ignores the `.devlog` directory.
