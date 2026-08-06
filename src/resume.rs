@@ -74,9 +74,9 @@ fn fetch_sessions() -> Result<Vec<SessionInfo>> {
     response.json().context("Failed to parse session list")
 }
 
-/// Group newest-first sessions by machine: local host first, remaining hosts
-/// ordered by their most recent activity. Input order (newest first) is
-/// preserved within each group.
+/// Group newest-first sessions by machine: hosts ordered by their most recent
+/// activity, except the local host which goes last (nearest the prompt).
+/// Input order (newest first) is preserved within each group.
 fn group_by_host(sessions: Vec<SessionInfo>, local_host: &str) -> Vec<(String, Vec<SessionInfo>)> {
     let mut groups: Vec<(String, Vec<SessionInfo>)> = Vec::new();
     for session in sessions {
@@ -86,13 +86,13 @@ fn group_by_host(sessions: Vec<SessionInfo>, local_host: &str) -> Vec<(String, V
         }
     }
     // Hosts already appear in newest-activity order (first session seen per
-    // host is its newest); just float the local host to the top.
+    // host is its newest); just sink the local host to the bottom.
     if let Some(pos) = groups
         .iter()
         .position(|(host, _)| host.eq_ignore_ascii_case(local_host))
     {
         let local = groups.remove(pos);
-        groups.insert(0, local);
+        groups.push(local);
     }
     groups
 }
@@ -113,53 +113,34 @@ fn prompt_choice(max: usize) -> Result<Option<usize>> {
 }
 
 fn launch(session: &SessionInfo, local_host: &str) -> Result<()> {
-    let status = if session.machine.eq_ignore_ascii_case(local_host) {
-        if !std::path::Path::new(&session.project_dir).is_dir() {
-            bail!("Project directory no longer exists: {}", session.project_dir);
-        }
-        eprintln!(
-            "Resuming {} in {}",
-            session.session_id, session.project_dir
+    if !session.machine.eq_ignore_ascii_case(local_host) {
+        println!(
+            "Session lives on {} — ssh there and run `devlog resume`.",
+            session.machine
         );
-        std::process::Command::new("claude")
-            .args(["--resume", &session.session_id])
-            .current_dir(&session.project_dir)
-            .status()
-            .context("Failed to launch claude (is it on PATH?)")?
-    } else {
-        let remote_cmd = remote_command(&session.project_dir, &session.session_id);
-        eprintln!("Resuming on {}: {}", session.machine, remote_cmd);
-        std::process::Command::new("ssh")
-            .args(["-t", &session.machine, &remote_cmd])
-            .status()
-            .context("Failed to launch ssh")?
-    };
+        return Ok(());
+    }
+    if !std::path::Path::new(&session.project_dir).is_dir() {
+        bail!("Project directory no longer exists: {}", session.project_dir);
+    }
+    eprintln!(
+        "Resuming {} in {}",
+        session.session_id, session.project_dir
+    );
+    let status = std::process::Command::new("claude")
+        .args([
+            "--resume",
+            &session.session_id,
+            "--permission-mode",
+            "bypassPermissions",
+        ])
+        .current_dir(&session.project_dir)
+        .status()
+        .context("Failed to launch claude (is it on PATH?)")?;
     if !status.success() {
         bail!("claude exited with {}", status);
     }
     Ok(())
-}
-
-/// Build the remote shell command. Windows hosts (drive-letter project dirs)
-/// get cmd.exe syntax; everything else gets POSIX sh.
-fn remote_command(project_dir: &str, session_id: &str) -> String {
-    if is_windows_path(project_dir) {
-        format!("cd /d \"{}\" && claude --resume {}", project_dir, session_id)
-    } else {
-        format!(
-            "cd '{}' && claude --resume {}",
-            project_dir.replace('\'', r"'\''"),
-            session_id
-        )
-    }
-}
-
-fn is_windows_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
 }
 
 fn format_age(last_activity: &str) -> String {
@@ -190,25 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn local_host_group_floats_to_top() {
+    fn local_host_group_sinks_to_bottom() {
         let sessions = vec![session("beast", "a"), session("roob", "b"), session("beast", "c")];
         let groups = group_by_host(sessions, "ROOB");
-        assert_eq!(groups[0].0, "roob");
-        assert_eq!(groups[1].0, "beast");
-        assert_eq!(groups[1].1.len(), 2);
+        assert_eq!(groups[0].0, "beast");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "roob");
         // newest-first input order preserved within a group
-        assert_eq!(groups[1].1[0].session_id, "a");
-    }
-
-    #[test]
-    fn remote_command_per_platform() {
-        assert_eq!(
-            remote_command(r"C:\Git\Retro", "abc"),
-            r#"cd /d "C:\Git\Retro" && claude --resume abc"#
-        );
-        assert_eq!(
-            remote_command("/home/matt/it's", "abc"),
-            r#"cd '/home/matt/it'\''s' && claude --resume abc"#
-        );
+        assert_eq!(groups[0].1[0].session_id, "a");
     }
 }

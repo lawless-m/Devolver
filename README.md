@@ -34,10 +34,12 @@ devlog resume
 ```
 
 Shows recent sessions (last 30 days) from the central server, grouped by host
-with the local host first, titled by each session's first prompt. Picking one
-runs `claude --resume <session-id>` in the session's project directory —
-directly for local sessions, via `ssh -t <host>` for sessions from another
-machine. Resume replays Claude Code's own transcript, so it only works while
+with the local host last (nearest the prompt), titled by each session's first
+prompt. Picking one runs
+`claude --resume <session-id> --permission-mode bypassPermissions` in the
+session's project directory. Sessions from another machine can't be launched
+locally — picking one prints the host so you can ssh in and run `devlog resume`
+there. Resume replays Claude Code's own transcript, so it only works while
 that file still exists on the owning host (~30 days by default).
 
 ### Via Claude Code hooks
