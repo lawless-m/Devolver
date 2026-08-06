@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     files_touched INTEGER NOT NULL,
     prompt_words INTEGER NOT NULL,
     response_words INTEGER NOT NULL,
+    project_dir TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
     UNIQUE(machine, project, session_id)
 );
 CREATE TABLE IF NOT EXISTS message_usage (
@@ -46,6 +48,15 @@ pub fn open(storage_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(&path)
         .with_context(|| format!("Failed to open stats index: {}", path.display()))?;
     conn.execute_batch(SCHEMA)?;
+    // Columns added after the table first shipped; ALTER fails harmlessly with
+    // "duplicate column" once applied. Pre-existing rows keep the '' default
+    // until the index is rebuilt (delete stats.sqlite and restart).
+    for col in ["project_dir", "title"] {
+        let _ = conn.execute(
+            &format!("ALTER TABLE sessions ADD COLUMN {} TEXT NOT NULL DEFAULT ''", col),
+            [],
+        );
+    }
     Ok(conn)
 }
 
@@ -146,6 +157,65 @@ fn count_words(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Menu title for a session: its first real user prompt, whitespace-collapsed
+/// and truncated. Image-only prompts ("[Image: ...]") and meta-wrapped ones
+/// ("<local-command-caveat>...", "<command-name>...") are skipped.
+fn session_title(devlog: &DevlogOutput) -> String {
+    for entry in &devlog.conversation {
+        if let ConversationEntry::User { content, .. } = entry {
+            let text: String = content.split_whitespace().collect::<Vec<_>>().join(" ");
+            if text.is_empty() || text.starts_with("[Image") || text.starts_with('<') {
+                continue;
+            }
+            if text.chars().count() > 60 {
+                let truncated: String = text.chars().take(59).collect();
+                return format!("{}…", truncated.trim_end());
+            }
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// One row of the resumable-session listing served at /api/sessions and
+/// consumed by `devlog resume`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionInfo {
+    pub machine: String,
+    pub project: String,
+    pub project_dir: String,
+    pub session_id: String,
+    pub last_activity: String,
+    pub title: String,
+}
+
+/// Sessions active in the last `days` days, newest first. Rows indexed before
+/// the project_dir column existed are excluded — there is nowhere to cd to.
+pub fn recent_sessions(conn: &Connection, days: u32) -> Result<Vec<SessionInfo>> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let mut stmt = conn.prepare(
+        "SELECT machine, project, project_dir, session_id, last_activity, title
+         FROM sessions
+         WHERE last_activity >= ?1 AND project_dir != ''
+         ORDER BY last_activity DESC",
+    )?;
+    let rows = stmt
+        .query_map([&cutoff], |row| {
+            Ok(SessionInfo {
+                machine: row.get(0)?,
+                project: row.get(1)?,
+                project_dir: row.get(2)?,
+                session_id: row.get(3)?,
+                last_activity: row.get(4)?,
+                title: row.get(5)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 fn extract_file_from_action(action: &str) -> Option<String> {
     // Actions look like: "edited src/main.rs", "read config.json", "created foo.txt"
     let prefixes = ["edited ", "read ", "created "];
@@ -186,8 +256,9 @@ pub fn upsert_devlog(
     let summary = summarize(devlog);
     conn.execute(
         "INSERT INTO sessions (machine, project, session_id, ingested_at, last_activity,
-                               prompts, tool_calls, files_touched, prompt_words, response_words)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                               prompts, tool_calls, files_touched, prompt_words, response_words,
+                               project_dir, title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             machine,
             project,
@@ -199,6 +270,8 @@ pub fn upsert_devlog(
             summary.files_touched as i64,
             summary.prompt_words as i64,
             summary.response_words as i64,
+            devlog.project_dir,
+            session_title(devlog),
         ],
     )?;
     let rowid = conn.last_insert_rowid();
@@ -367,6 +440,28 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sessions, 1);
+    }
+
+    #[test]
+    fn title_skips_meta_prompts_and_truncates() {
+        let mut d = devlog("s1", "2026-06-01T10:00:00Z", 1);
+        d.conversation.insert(
+            0,
+            ConversationEntry::User {
+                timestamp: None,
+                content: "<local-command-caveat>Caveat: generated</local-command-caveat>".to_string(),
+            },
+        );
+        assert_eq!(session_title(&d), "hello there");
+
+        let mut long = devlog("s2", "2026-06-01T10:00:00Z", 1);
+        long.conversation[0] = ConversationEntry::User {
+            timestamp: None,
+            content: "x".repeat(80),
+        };
+        let title = session_title(&long);
+        assert_eq!(title.chars().count(), 60);
+        assert!(title.ends_with('…'));
     }
 
     #[test]

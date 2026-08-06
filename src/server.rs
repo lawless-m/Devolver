@@ -54,6 +54,7 @@ pub async fn run_server(config: ServerConfig) -> anyhow::Result<()> {
         .route("/stats", get(stats_page))
         .route("/session", get(session_page))
         .route("/search", get(search_page))
+        .route("/api/sessions", get(api_sessions))
         .route("/ingest", post(ingest))
         // Long sessions exceed axum's 2MB default body limit
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
@@ -1095,6 +1096,30 @@ fn highlight_match(snippet: &str, query: &str) -> String {
         format!("{}<mark>{}</mark>{}", before, matched, after)
     } else {
         escaped
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApiSessionsQuery {
+    days: Option<u32>,
+}
+
+/// JSON listing of recent sessions across all machines, for `devlog resume`.
+/// Defaults to 30 days — Claude Code's transcript retention window, beyond
+/// which a session can no longer be resumed anyway.
+async fn api_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ApiSessionsQuery>,
+) -> impl IntoResponse {
+    let days = query.days.unwrap_or(30);
+    let db = state.db.lock().expect("stats db lock poisoned");
+    match index::recent_sessions(&db, days) {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error: {}", e),
+        )
+            .into_response(),
     }
 }
 

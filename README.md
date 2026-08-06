@@ -27,6 +27,19 @@ cargo build --release
 devlog ingest <path-to-session.jsonl>
 ```
 
+### Rejoin a past session
+
+```bash
+devlog resume
+```
+
+Shows recent sessions (last 30 days) from the central server, grouped by host
+with the local host first, titled by each session's first prompt. Picking one
+runs `claude --resume <session-id>` in the session's project directory —
+directly for local sessions, via `ssh -t <host>` for sessions from another
+machine. Resume replays Claude Code's own transcript, so it only works while
+that file still exists on the owning host (~30 days by default).
+
 ### Via Claude Code hooks
 
 Configure in `.claude/settings.json` to trigger on `PreCompact` and `SessionEnd`.

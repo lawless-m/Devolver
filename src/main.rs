@@ -4,6 +4,7 @@ mod output;
 mod config;
 mod index;
 mod push;
+mod resume;
 mod server;
 mod stats;
 mod search;
@@ -34,6 +35,8 @@ enum Commands {
         /// Path to the devlog JSON file to push (optional - will find most recent)
         path: Option<PathBuf>,
     },
+    /// Pick a recent session (any host) and rejoin it with `claude --resume`
+    Resume,
     /// Run the devlog receiver server
     Serve {
         /// Port to listen on (default: 8090)
@@ -62,6 +65,10 @@ fn main() -> Result<()> {
         Commands::Push { path } => {
             version::warn_if_outdated();
             push_session(path)?;
+        }
+        Commands::Resume => {
+            version::warn_if_outdated();
+            resume::resume()?;
         }
         Commands::Serve { port, storage } => {
             version::warn_if_outdated();
