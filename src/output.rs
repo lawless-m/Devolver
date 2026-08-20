@@ -76,11 +76,16 @@ fn get_output_dir(project_dir: &str) -> Result<PathBuf> {
 /// The project path is flattened to a single directory name (like Claude Code
 /// munges cwd), so sessions from different projects don't collide.
 fn fallback_output_dir(project_dir: &str) -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .context("Neither USERPROFILE nor HOME environment variable is set")?;
     let munged: String = project_dir
         .trim()
         .chars()
-        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        // The drive colon has to go too: "C:-Windows" is not a legal directory
+        // name, and Path::join treats it as drive-relative and drops the home
+        // prefix. Same flattening Claude Code applies to its own project dirs.
+        .map(|c| if c == '/' || c == '\\' || c == ':' { '-' } else { c })
         .collect();
     let munged = munged.trim_matches('-');
     let munged = if munged.is_empty() { "root" } else { munged };
