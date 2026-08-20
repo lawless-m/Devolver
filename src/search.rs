@@ -83,7 +83,19 @@ pub fn search_devlogs(
                         }
 
                         // Search conversation entries
-                        for entry in &devlog.conversation {
+                        let timestamps = entry_timestamps(&devlog);
+                        for (entry, ts) in devlog.conversation.iter().zip(timestamps) {
+                            // The file-level check above only rules out files whose
+                            // whole history predates the cutoff; a recently ingested
+                            // file can still hold old conversation, so filter again
+                            // on when each entry was actually written.
+                            if let Some(ref cutoff) = cutoff {
+                                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                                    if dt < *cutoff {
+                                        continue;
+                                    }
+                                }
+                            }
                             if let Some(result) = search_entry(
                                 entry,
                                 &query_lower,
@@ -91,7 +103,7 @@ pub fn search_devlogs(
                                 scope,
                                 &machine,
                                 &project,
-                                &devlog.timestamp,
+                                ts,
                             ) {
                                 results.push(result);
                                 if results.len() >= limit {
@@ -115,6 +127,38 @@ fn read_devlog(path: &Path) -> Result<DevlogOutput> {
     let content = fs::read_to_string(path)?;
     let devlog: DevlogOutput = serde_json::from_str(&content)?;
     Ok(devlog)
+}
+
+/// When each entry was written. Tool summaries carry no timestamp of their own,
+/// so they inherit the turn they follow; the file's ingest time is used only when
+/// nothing in the conversation is timestamped. Re-ingesting an old session must
+/// not re-date its contents.
+fn entry_timestamps<'a>(devlog: &'a DevlogOutput) -> Vec<&'a str> {
+    let first = devlog
+        .conversation
+        .iter()
+        .find_map(|e| match e {
+            ConversationEntry::User { timestamp, .. }
+            | ConversationEntry::Assistant { timestamp, .. } => timestamp.as_deref(),
+            ConversationEntry::ToolSummary { .. } => None,
+        })
+        .unwrap_or(&devlog.timestamp);
+
+    let mut last = first;
+    devlog
+        .conversation
+        .iter()
+        .map(|entry| {
+            if let ConversationEntry::User { timestamp, .. }
+            | ConversationEntry::Assistant { timestamp, .. } = entry
+            {
+                if let Some(ts) = timestamp.as_deref() {
+                    last = ts;
+                }
+            }
+            last
+        })
+        .collect()
 }
 
 fn search_entry(
@@ -207,4 +251,62 @@ fn create_snippet(content: &str, query_lower: &str) -> String {
     }
 
     snippet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A June conversation, re-ingested in July: entries must keep their own
+    /// dates, and the tool summary must inherit the turn it follows rather than
+    /// the ingest time.
+    fn re_ingested_devlog() -> DevlogOutput {
+        DevlogOutput {
+            schema_version: "1.0".to_string(),
+            session_id: "s1".to_string(),
+            timestamp: "2026-07-13T15:23:12Z".to_string(),
+            machine_id: "m1".to_string(),
+            project_dir: "/p/proj".to_string(),
+            git: None,
+            conversation: vec![
+                ConversationEntry::User {
+                    timestamp: Some("2026-06-22T15:57:54Z".to_string()),
+                    content: "fetch the T0 pdf".to_string(),
+                },
+                ConversationEntry::ToolSummary {
+                    actions: vec!["read T0.pdf".to_string()],
+                },
+                ConversationEntry::Assistant {
+                    timestamp: Some("2026-06-22T15:58:23Z".to_string()),
+                    content: "done".to_string(),
+                    usage: None,
+                    model: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn entries_keep_their_own_dates_when_re_ingested() {
+        let devlog = re_ingested_devlog();
+        let stamps = entry_timestamps(&devlog);
+        assert_eq!(
+            stamps,
+            vec![
+                "2026-06-22T15:57:54Z",
+                "2026-06-22T15:57:54Z", // tool summary follows the prompt
+                "2026-06-22T15:58:23Z",
+            ]
+        );
+        assert!(!stamps.contains(&devlog.timestamp.as_str()));
+    }
+
+    #[test]
+    fn file_timestamp_is_used_only_when_nothing_is_dated() {
+        let mut devlog = re_ingested_devlog();
+        devlog.conversation = vec![ConversationEntry::ToolSummary {
+            actions: vec!["read T0.pdf".to_string()],
+        }];
+        assert_eq!(entry_timestamps(&devlog), vec!["2026-07-13T15:23:12Z"]);
+    }
 }
