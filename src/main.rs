@@ -150,45 +150,45 @@ fn ingest_session(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// How long to wait for a hook to deliver its JSON payload on stdin.
+const HOOK_STDIN_TIMEOUT_SECS: u64 = 10;
+
 fn find_session_from_stdin_or_recent() -> Result<PathBuf> {
-    // First, try to read from stdin (hook input)
     use std::io::{self, Read};
 
-    let mut stdin_content = String::new();
-
-    // Try non-blocking read from stdin
+    // Stdin is a pipe, so this is a hook firing and its payload names the session
+    // that triggered it. Wait for it and insist on it: falling back to "whichever
+    // session wrote last" snapshots an unrelated session on a machine running more
+    // than one, and the session that actually fired the hook is never captured.
     if !atty::is(atty::Stream::Stdin) {
-        // Stdin is a pipe - read with a short timeout to avoid hanging
-        // when the pipe doesn't close promptly (e.g. Claude Code hooks)
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = String::new();
             let _ = io::stdin().lock().read_to_string(&mut buf);
             let _ = tx.send(buf);
         });
-        if let Ok(buf) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
-            stdin_content = buf;
-        }
+        let stdin_content = rx
+            .recv_timeout(std::time::Duration::from_secs(HOOK_STDIN_TIMEOUT_SECS))
+            .context("Timed out waiting for hook input on stdin")?;
+
+        let json: serde_json::Value = serde_json::from_str(&stdin_content)
+            .context("Hook input on stdin was not JSON")?;
+        let path = json
+            .get("transcript_path")
+            .or_else(|| json.get("session_file"))
+            .and_then(|v| v.as_str())
+            .context("Hook input on stdin carried no transcript_path")?;
+        return Ok(PathBuf::from(path));
     }
 
-    // Try to parse stdin as JSON with transcript path
-    if !stdin_content.is_empty() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdin_content) {
-            if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
-                return Ok(PathBuf::from(path));
-            }
-            if let Some(path) = json.get("session_file").and_then(|v| v.as_str()) {
-                return Ok(PathBuf::from(path));
-            }
-        }
-    }
-
-    // Fallback: find most recent session in ~/.claude/
+    // Run by hand from a terminal: the most recent session is the one meant.
     find_most_recent_session()
 }
 
 fn find_most_recent_session() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .context("Neither USERPROFILE nor HOME environment variable is set")?;
     let claude_dir = PathBuf::from(home).join(".claude").join("projects");
 
     if !claude_dir.exists() {
