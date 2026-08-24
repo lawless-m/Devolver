@@ -348,13 +348,30 @@ fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        // max_len counts bytes, so the cut can land inside a multi-byte
+        // character — an em dash or a curly quote is enough to panic here.
+        // Walk back to the nearest boundary rather than slicing blind.
+        let mut end = max_len - 3;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_cuts_on_a_char_boundary() {
+        // An em dash straddling the cut used to panic the whole ingest.
+        let s = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{2014}bbbb";
+        assert!(!s.is_char_boundary(47));
+        let out = truncate(s, 50);
+        assert!(out.ends_with("..."));
+        assert!(s.starts_with(out.trim_end_matches('.')));
+    }
 
     #[test]
     fn assistant_entry_captures_model_and_usage() {
